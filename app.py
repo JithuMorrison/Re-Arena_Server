@@ -150,13 +150,39 @@ class CustomPPO:
         self.gamma = gamma
         self.clip_epsilon = clip_epsilon
         self.memory = deque(maxlen=10000)
+    
+    def process_actions(self, raw_actions):
+        processed = np.zeros_like(raw_actions)
+
+        ranges = {
+            0: (0, 5),    # spawnAreaSize
+            1: (0, 10),    # bubbleSpeedAction
+            2: (1, 10),    # bubbleLifetime
+            3: (0, 20),    # spawnHeight
+            4: (1, 20),    # numBubbles (int)
+            5: (0.1, 5),   # bubbleSize # guidanceOn is handled separately
+        }
+
+        for i in range(6):  # first 6 are continuous
+            low, high = ranges[i]
+            processed[i] = low + (raw_actions[i] + 1) * 0.5 * (high - low)
+
+        # integer rounding
+        processed[4] = int(round(processed[4]))
+        # boolean flag
+        processed[6] = 1 if raw_actions[6] > 0 else 0
+
+        return processed
         
     def get_action(self, state):
         device = next(self.policy_net.parameters()).device
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
         with torch.no_grad():
-            action = self.policy_net(state_tensor)
-        return action.squeeze(0).cpu().numpy()
+            raw_action = self.policy_net(state_tensor)
+        raw_action = raw_action.squeeze(0).cpu().numpy()
+
+        # 🔑 Scale into valid Unity values before returning
+        return self.process_actions(raw_action)
     
     def store_transition(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
@@ -474,18 +500,14 @@ def create_session():
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 @app.route('/api/session/<session_id>', methods=['PUT'])
-def update_session():
+def update_session(session_id):
     try:
         data = request.get_json()
         if not data:
             return jsonify({'error': 'No data provided'}), 400
-            
-        session_id = data.get('sessionId')
+
         game_data = data.get('gameData', {})
         status = data.get('status')
-
-        if not session_id:
-            return jsonify({'error': 'sessionId is required'}), 400
 
         update_data = {}
         if game_data:
@@ -496,13 +518,14 @@ def update_session():
         if not update_data:
             return jsonify({'error': 'No data to update'}), 400
 
+        # Use the session_id from URL, not the JSON
         sessions_collection.update_one(
             {'sessionId': session_id},
             {'$set': update_data}
         )
 
         return jsonify({'message': 'Session updated successfully'}), 200
-        
+
     except Exception as e:
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
@@ -945,10 +968,10 @@ def usercode_unity():
         if request.is_json:
             data = request.get_json()
             user_code = data.get('usercode') or data.get('userCode')
-            game_name = data.get('gameName', 'bubble_game')
+            game_name = data.get('gameName')  # optional now
         else:
             user_code = request.form.get('usercode') or request.form.get('userCode')
-            game_name = request.form.get('gameName', 'bubble_game')
+            game_name = request.form.get('gameName')  # optional now
             
         if not user_code:
             return jsonify({'error': 'usercode is required'}), 400
@@ -957,25 +980,22 @@ def usercode_unity():
         if not user:
             return jsonify({'error': 'User not found'}), 404
 
-        game_config = None
+        game_configs = {}
         if user['userType'] == 'patient':
             patient_games = patient_games_collection.find_one({
                 'patientId': user['_id']
             })
             
-            if patient_games:
-                config_data = patient_games.get('game_configs', {}).get(game_name)
-                if config_data and config_data.get('enabled', True):
-                    game_config = config_data
+            if patient_games and 'game_configs' in patient_games:
+                # ✅ return all game configs instead of single one
+                game_configs = patient_games['game_configs']
 
-        if not game_config:
-            game_config = {
-                'difficulty': 'medium',
-                'target_score': 20,
-                'max_bubbles': 10,
-                'spawn_area': {'x_min': -5, 'x_max': 5, 'y_min': 1, 'y_max': 5, 'z_min': -5, 'z_max': 5}
-            }
+        # ✅ default configs for games without stored configs
+        default_config = {
+            'difficulty': 'medium'
+        }
 
+        # Fetch all available games
         games = list(games_collection.find({'available': True}))
         
         if not games:
@@ -985,6 +1005,12 @@ def usercode_unity():
                 {'name': 'Reaction Time', 'description': 'Develop faster responses', 'difficulty': 'hard'}
             ]
 
+        # ✅ merge defaults for missing configs
+        merged_configs = {}
+        for game in games:
+            gname = game.get('name').lower().replace(" ", "_")
+            merged_configs[gname] = game_configs.get(gname, default_config)
+
         return jsonify({
             'success': True,
             'user': {
@@ -993,7 +1019,7 @@ def usercode_unity():
                 'userCode': user['userCode'],
                 'userType': user['userType']
             },
-            'gameConfig': game_config,
+            'gameConfigs': merged_configs,   # ✅ send all configs
             'games': [to_json(game) for game in games]
         }), 200
         
