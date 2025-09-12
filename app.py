@@ -42,15 +42,18 @@ reports_collection = db.reports
 # Helper Functions and Classes
 # -----------------------
 class GameConfig:
-    """Game configuration class"""
-    def __init__(self, game_name: str, difficulty: str, target_score: int, 
-                 max_bubbles: int, spawn_area: dict, enabled: bool = True):
+    """Game configuration class for bubble_game"""
+    def __init__(self, game_name: str, difficulty: str = "medium", enabled: bool = True, target_score: int = 20, spawnAreaSize: float = 5.0, bubbleSpeedAction: float = 5.0, bubbleLifetime: float = 3.0, spawnHeight: float = 3.0, numBubbles: int = 10,bubbleSize: float = 1.0):
         self.game_name = game_name
         self.difficulty = difficulty
-        self.target_score = target_score
-        self.max_bubbles = max_bubbles
-        self.spawn_area = spawn_area
         self.enabled = enabled
+        self.target_score = target_score
+        self.spawnAreaSize = spawnAreaSize
+        self.bubbleSpeedAction = bubbleSpeedAction
+        self.bubbleLifetime = bubbleLifetime
+        self.spawnHeight = spawnHeight
+        self.numBubbles = numBubbles
+        self.bubbleSize = bubbleSize
 
 def game_config_to_dict(config: GameConfig) -> dict:
     """Convert GameConfig to dictionary"""
@@ -210,7 +213,7 @@ class CustomPPO:
         
         for _ in range(epochs):
             current_actions = self.policy_net(states)
-            policy_loss = -torch.mean(advantages * current_actions)
+            policy_loss = -torch.mean(torch.sum(current_actions * advantages.unsqueeze(1), dim=1))
             
             value_loss = nn.MSELoss()(self.value_net(states).squeeze(), rewards + self.gamma * next_values * (1 - dones))
             
@@ -446,6 +449,7 @@ def assign_instructor():
     except Exception as e:
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
+# Update the session creation endpoint to handle reviews for existing sessions
 @app.route('/api/session', methods=['POST'])
 def create_session():
     try:
@@ -459,13 +463,47 @@ def create_session():
         game_data = data.get('gameData', {})
         review = data.get('review', '')
         rating = data.get('rating', 0)
-        session_id = generate_session_id()
-
+        session_id = data.get('sessionId')  # Allow passing existing session ID
+        
+        # Check if this is a review for an existing session
+        existing_session = None
+        if session_id:
+            existing_session = sessions_collection.find_one({'sessionId': session_id})
+            if not existing_session:
+                return jsonify({'error': 'Session not found'}), 404
+        
         if not therapist_id or not patient_id:
             return jsonify({'error': 'therapistId and patientId are required'}), 400
 
         if rating and (rating < 1 or rating > 5):
             return jsonify({'error': 'Rating must be between 1 and 5'}), 400
+
+        # If updating an existing session with a review
+        if existing_session:
+            update_data = {
+                'review': review,
+                'rating': rating,
+                'status': 'completed',
+                'endTime': datetime.now(timezone.utc)
+            }
+            
+            # Add game data if provided
+            if game_data:
+                update_data['gameData'] = {**existing_session.get('gameData', {}), **game_data}
+            
+            sessions_collection.update_one(
+                {'sessionId': session_id},
+                {'$set': update_data}
+            )
+            
+            return jsonify({
+                'message': 'Session review added successfully',
+                'sessionId': session_id
+            }), 200
+        
+        # Otherwise create a new session
+        if not session_id:
+            session_id = generate_session_id()
 
         session_data = {
             'sessionId': session_id,
@@ -732,13 +770,8 @@ def update_patient_games():
         validated_configs = {}
         for game_name, config in game_configs.items():
             if config.get('enabled', True):
-                if not all(key in config for key in ['difficulty', 'target_score', 'max_bubbles', 'spawn_area']):
+                if not all(key in config for key in ["difficulty", "spawnAreaSize", "bubbleSpeedAction", "bubbleLifetime", "spawnHeight", "numBubbles", "bubbleSize"]):
                     return jsonify({'error': f'Missing required fields for {game_name}'}), 400
-                
-                spawn_area = config['spawn_area']
-                required_keys = ['x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max']
-                if not all(key in spawn_area for key in required_keys):
-                    return jsonify({'error': f'Invalid spawn area for {game_name}'}), 400
 
             validated_configs[game_name] = config
 
@@ -938,7 +971,7 @@ def ppo_action():
         print(f"Error in ppo_action: {str(e)}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
-@app.route("/api/ppo_train", methods=["POST"])
+@app.route("/ppo_train", methods=["POST"])
 def ppo_train():
     try:
         data = request.get_json()
@@ -952,7 +985,9 @@ def ppo_train():
             action = np.array(transition["action"], dtype=np.float32)
             reward = transition["reward"]
             next_state = np.array(transition["next_state"], dtype=np.float32)
-            done = transition["done"]
+            
+            # 🔹 Use .get() with default False for done
+            done = transition.get("done", False)
             
             ppo_model.store_transition(state, action, reward, next_state, done)
         
@@ -960,6 +995,7 @@ def ppo_train():
         
         return jsonify({"message": "Training completed successfully"})
     except Exception as e:
+        print(f"Error in ppo_train: {str(e)}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 @app.route('/usercodeunity', methods=['POST'])
