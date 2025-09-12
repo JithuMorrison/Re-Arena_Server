@@ -1,4 +1,3 @@
-# app.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pymongo import MongoClient
@@ -14,8 +13,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from collections import deque
-from typing import List, Dict, Any
 import json
+import uuid
 
 # Load environment variables
 load_dotenv()
@@ -37,9 +36,11 @@ instructors_collection = db.instructors
 sessions_collection = db.sessions
 games_collection = db.games
 patient_games_collection = db.patient_games
-game_limits_collection = db.game_limits
+reports_collection = db.reports
 
-# Add these helper functions and classes
+# -----------------------
+# Helper Functions and Classes
+# -----------------------
 class GameConfig:
     """Game configuration class"""
     def __init__(self, game_name: str, difficulty: str, target_score: int, 
@@ -48,7 +49,7 @@ class GameConfig:
         self.difficulty = difficulty
         self.target_score = target_score
         self.max_bubbles = max_bubbles
-        self.spawn_area = spawn_area  # {x_min, x_max, y_min, y_max, z_min, z_max}
+        self.spawn_area = spawn_area
         self.enabled = enabled
 
 def game_config_to_dict(config: GameConfig) -> dict:
@@ -73,9 +74,44 @@ def dict_to_game_config(data: dict) -> GameConfig:
         enabled=data.get('enabled', True)
     )
 
-# -------------------------
-# Custom PPO Implementation (Python 3.12+ Compatible)
-# -------------------------
+def generate_user_code(name: str) -> str:
+    """Generate a unique user code from name initials and random digits"""
+    initials = ''.join(word[0].upper() for word in name.split() if word)
+    if not initials:
+        initials = "UC"
+    random_digits = ''.join(random.choices(string.digits, k=4))
+    return f"{initials}{random_digits}"
+
+def generate_session_id() -> str:
+    """Generate a unique session ID"""
+    return str(uuid.uuid4())[:8].upper()
+
+def to_json(document: dict) -> dict:
+    """Convert MongoDB ObjectId to string in a document"""
+    if not document:
+        return {}
+    
+    doc = document.copy()
+    if '_id' in doc:
+        doc['_id'] = str(doc['_id'])
+    
+    for key, value in doc.items():
+        if isinstance(value, ObjectId):
+            doc[key] = str(value)
+        elif isinstance(value, list):
+            doc[key] = [str(item) if isinstance(item, ObjectId) else item for item in value]
+        elif isinstance(value, dict):
+            doc[key] = to_json(value)
+    
+    return doc
+
+def is_valid_email(email: str) -> bool:
+    """Basic email validation"""
+    return '@' in email and '.' in email
+
+# -----------------------
+# PPO Implementation
+# -----------------------
 class PolicyNetwork(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(PolicyNetwork, self).__init__()
@@ -88,7 +124,7 @@ class PolicyNetwork(nn.Module):
     def forward(self, x):
         x = self.relu(self.fc1(x))
         x = self.relu(self.fc2(x))
-        x = self.tanh(self.fc3(x))  # Actions between -1 and 1
+        x = self.tanh(self.fc3(x))
         return x
 
 class ValueNetwork(nn.Module):
@@ -129,10 +165,8 @@ class CustomPPO:
         if len(self.memory) < batch_size:
             return
         
-        # Get device
         device = next(self.policy_net.parameters()).device
         
-        # Convert memory to tensors with device
         states, actions, rewards, next_states, dones = zip(*self.memory)
         
         states = torch.FloatTensor(np.array(states)).to(device)
@@ -141,25 +175,19 @@ class CustomPPO:
         next_states = torch.FloatTensor(np.array(next_states)).to(device)
         dones = torch.FloatTensor(np.array(dones)).to(device)
         
-        # Calculate advantages
         with torch.no_grad():
             values = self.value_net(states).squeeze()
             next_values = self.value_net(next_states).squeeze()
             advantages = rewards + self.gamma * next_values * (1 - dones) - values
         
-        # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
-        # Update policy and value networks
         for _ in range(epochs):
-            # Policy loss
             current_actions = self.policy_net(states)
             policy_loss = -torch.mean(advantages * current_actions)
             
-            # Value loss
             value_loss = nn.MSELoss()(self.value_net(states).squeeze(), rewards + self.gamma * next_values * (1 - dones))
             
-            # Update networks
             self.policy_optimizer.zero_grad()
             policy_loss.backward()
             self.policy_optimizer.step()
@@ -168,46 +196,12 @@ class CustomPPO:
             value_loss.backward()
             self.value_optimizer.step()
         
-        # Clear memory
         self.memory.clear()
 
-# Initialize custom PPO model
+# Initialize PPO model
 state_dim = 11
 action_dim = 7
 ppo_model = CustomPPO(state_dim, action_dim)
-
-# -----------------------
-# Helper Functions
-# -----------------------
-def generate_user_code(name: str) -> str:
-    """Generate a unique user code from name initials and random digits"""
-    initials = ''.join(word[0].upper() for word in name.split() if word)
-    if not initials:
-        initials = "UC"  # Default if name is empty
-    random_digits = ''.join(random.choices(string.digits, k=4))
-    return f"{initials}{random_digits}"
-
-def to_json(document: dict) -> dict:
-    """Convert MongoDB ObjectId to string in a document"""
-    if not document:
-        return {}
-    
-    doc = document.copy()
-    if '_id' in doc:
-        doc['_id'] = str(doc['_id'])
-    
-    # Convert other ObjectId fields
-    for key, value in doc.items():
-        if isinstance(value, ObjectId):
-            doc[key] = str(value)
-        elif isinstance(value, list):
-            doc[key] = [str(item) if isinstance(item, ObjectId) else item for item in value]
-    
-    return doc
-
-def is_valid_email(email: str) -> bool:
-    """Basic email validation"""
-    return '@' in email and '.' in email
 
 # -----------------------
 # Routes
@@ -224,12 +218,11 @@ def register():
         email = data.get('email')
         password = data.get('password')
 
-        # Validate input
         if not all([user_type, name, email, password]):
             return jsonify({'error': 'Missing required fields'}), 400
         
         if user_type not in ['therapist', 'instructor']:
-            return jsonify({'error': 'Invalid user type. Must be therapist or instructor'}), 400
+            return jsonify({'error': 'Invalid user type'}), 400
         
         if not is_valid_email(email):
             return jsonify({'error': 'Invalid email format'}), 400
@@ -237,21 +230,15 @@ def register():
         if len(password) < 6:
             return jsonify({'error': 'Password must be at least 6 characters'}), 400
 
-        # Check if user already exists
         if users_collection.find_one({'email': email}):
             return jsonify({'error': 'User already exists with this email'}), 400
 
-        # Hash password
         hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
-
-        # Generate user code for therapists and instructors
         user_code = generate_user_code(name)
         
-        # Check if user code is unique
         while users_collection.find_one({'userCode': user_code}):
-            user_code = generate_user_code(name)  # Regenerate if not unique
+            user_code = generate_user_code(name)
 
-        # Create user document
         user_data = {
             'name': name,
             'email': email,
@@ -261,11 +248,9 @@ def register():
             'createdAt': datetime.now(timezone.utc)
         }
         
-        # Insert user
         result = users_collection.insert_one(user_data)
         user_id = result.inserted_id
 
-        # Add to specific collection (therapist or instructor)
         if user_type == 'therapist':
             therapists_collection.insert_one({
                 'userId': user_id,
@@ -310,7 +295,6 @@ def login():
         if not user:
             return jsonify({'error': 'Invalid credentials'}), 401
         
-        # Check password
         if not bcrypt.checkpw(password.encode('utf-8'), user['password']):
             return jsonify({'error': 'Invalid credentials'}), 401
 
@@ -335,7 +319,6 @@ def get_therapist_patients():
         if not therapist_id:
             return jsonify({'error': 'therapistId is required'}), 400
 
-        # Find therapist by userId (not _id)
         therapist = therapists_collection.find_one({'userId': ObjectId(therapist_id)})
         if not therapist:
             return jsonify({'error': 'Therapist not found'}), 404
@@ -366,12 +349,10 @@ def add_patient():
         if not therapist_id or not patient_data:
             return jsonify({'error': 'Missing required fields'}), 400
 
-        # Validate therapist exists
         therapist = therapists_collection.find_one({'userId': ObjectId(therapist_id)})
         if not therapist:
             return jsonify({'error': 'Therapist not found'}), 404
 
-        # Create patient user
         patient_user_data = {
             'name': patient_data.get('name'),
             'email': patient_data.get('email'),
@@ -382,17 +363,14 @@ def add_patient():
             'createdAt': datetime.now(timezone.utc)
         }
         
-        # Generate unique user code for patient
         user_code = generate_user_code(patient_user_data['name'])
         while users_collection.find_one({'userCode': user_code}):
             user_code = generate_user_code(patient_user_data['name'])
         patient_user_data['userCode'] = user_code
 
-        # Insert patient
         patient_result = users_collection.insert_one(patient_user_data)
         patient_id = patient_result.inserted_id
 
-        # Add to therapist's patients
         therapists_collection.update_one(
             {'userId': ObjectId(therapist_id)},
             {'$push': {'patients': patient_id}}
@@ -403,6 +381,41 @@ def add_patient():
             'patientId': str(patient_id),
             'userCode': user_code
         }), 201
+        
+    except Exception as e:
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
+
+@app.route('/api/therapist/assign-instructor', methods=['POST'])
+def assign_instructor():
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+            
+        therapist_id = data.get('therapistId')
+        patient_id = data.get('patientId')
+        instructor_id = data.get('instructorId')
+
+        if not all([therapist_id, patient_id, instructor_id]):
+            return jsonify({'error': 'Missing required fields'}), 400
+
+        therapist = therapists_collection.find_one({'userId': ObjectId(therapist_id)})
+        if not therapist:
+            return jsonify({'error': 'Therapist not found'}), 404
+
+        if ObjectId(patient_id) not in therapist.get('patients', []):
+            return jsonify({'error': 'Patient not found for this therapist'}), 404
+
+        instructor = instructors_collection.find_one({'userId': ObjectId(instructor_id)})
+        if not instructor:
+            return jsonify({'error': 'Instructor not found'}), 404
+
+        users_collection.update_one(
+            {'_id': ObjectId(patient_id)},
+            {'$set': {'instructorId': ObjectId(instructor_id)}}
+        )
+
+        return jsonify({'message': 'Instructor assigned successfully'}), 200
         
     except Exception as e:
         return jsonify({'error': f'Server error: {str(e)}'}), 500
@@ -420,42 +433,91 @@ def create_session():
         game_data = data.get('gameData', {})
         review = data.get('review', '')
         rating = data.get('rating', 0)
+        session_id = generate_session_id()
 
         if not therapist_id or not patient_id:
             return jsonify({'error': 'therapistId and patientId are required'}), 400
 
-        # Validate rating
         if rating and (rating < 1 or rating > 5):
             return jsonify({'error': 'Rating must be between 1 and 5'}), 400
 
         session_data = {
+            'sessionId': session_id,
             'therapistId': ObjectId(therapist_id),
             'patientId': ObjectId(patient_id),
-            'instructorId': ObjectId(instructor_id),
             'gameData': game_data,
             'review': review,
             'rating': rating,
-            'date': datetime.now(timezone.utc)
+            'date': datetime.now(timezone.utc),
+            'status': 'active'
         }
         
-        # Add instructor if provided
         if instructor_id:
             session_data['instructorId'] = ObjectId(instructor_id)
 
         result = sessions_collection.insert_one(session_data)
-        session_id = result.inserted_id
+        session_id_db = result.inserted_id
 
-        # Add to instructor's sessions if applicable
         if instructor_id:
             instructors_collection.update_one(
                 {'userId': ObjectId(instructor_id)},
-                {'$push': {'sessions': session_id}}
+                {'$push': {'sessions': session_id_db}}
             )
 
         return jsonify({
             'message': 'Session created successfully',
-            'sessionId': str(session_id)
+            'sessionId': session_id,
+            'sessionIdDb': str(session_id_db)
         }), 201
+        
+    except Exception as e:
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
+
+@app.route('/api/session/<session_id>', methods=['PUT'])
+def update_session():
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+            
+        session_id = data.get('sessionId')
+        game_data = data.get('gameData', {})
+        status = data.get('status')
+
+        if not session_id:
+            return jsonify({'error': 'sessionId is required'}), 400
+
+        update_data = {}
+        if game_data:
+            update_data['gameData'] = game_data
+        if status:
+            update_data['status'] = status
+
+        if not update_data:
+            return jsonify({'error': 'No data to update'}), 400
+
+        sessions_collection.update_one(
+            {'sessionId': session_id},
+            {'$set': update_data}
+        )
+
+        return jsonify({'message': 'Session updated successfully'}), 200
+        
+    except Exception as e:
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
+
+@app.route('/api/session/<session_id>/close', methods=['POST'])
+def close_session(session_id):
+    try:
+        if not session_id:
+            return jsonify({'error': 'sessionId is required'}), 400
+
+        sessions_collection.update_one(
+            {'sessionId': session_id},
+            {'$set': {'status': 'completed', 'endTime': datetime.now(timezone.utc)}}
+        )
+
+        return jsonify({'message': 'Session closed successfully'}), 200
         
     except Exception as e:
         return jsonify({'error': f'Server error: {str(e)}'}), 500
@@ -466,57 +528,99 @@ def get_sessions():
         user_id = request.args.get('userId')
         user_code = request.args.get('userCode')
         user_type = request.args.get('userType')
+        patient_id = request.args.get('patientId')
 
         if not user_type:
             return jsonify({'error': 'userType is required'}), 400
 
-        # Build query based on available parameters
         query = {}
         
         if user_type == 'therapist':
             if user_id:
                 query['therapistId'] = ObjectId(user_id)
             elif user_code:
-                # Find therapist by userCode and get their userId
                 therapist = therapists_collection.find_one({'userCode': user_code})
                 if therapist:
                     query['therapistId'] = therapist['userId']
                 else:
-                    return jsonify({'error': 'Therapist not found with this user code'}), 404
+                    return jsonify({'error': 'Therapist not found'}), 404
             else:
-                return jsonify({'error': 'userId or userCode is required for therapist'}), 400
+                return jsonify({'error': 'userId or userCode is required'}), 400
                 
         elif user_type == 'instructor':
             if user_id:
                 query['instructorId'] = ObjectId(user_id)
             elif user_code:
-                # Find instructor by userCode and get their userId
                 instructor = instructors_collection.find_one({'userCode': user_code})
                 if instructor:
                     query['instructorId'] = instructor['userId']
                 else:
-                    return jsonify({'error': 'Instructor not found with this user code'}), 404
+                    return jsonify({'error': 'Instructor not found'}), 404
             else:
-                return jsonify({'error': 'userId or userCode is required for instructor'}), 400
+                return jsonify({'error': 'userId or userCode is required'}), 400
                 
         elif user_type == 'patient':
             if user_id:
                 query['patientId'] = ObjectId(user_id)
             elif user_code:
-                # Find patient by userCode and get their userId
                 patient = users_collection.find_one({'userCode': user_code, 'userType': 'patient'})
                 if patient:
                     query['patientId'] = patient['_id']
                 else:
-                    return jsonify({'error': 'Patient not found with this user code'}), 404
+                    return jsonify({'error': 'Patient not found'}), 404
             else:
-                return jsonify({'error': 'userId or userCode is required for patient'}), 400
+                return jsonify({'error': 'userId or userCode is required'}), 400
         else:
             return jsonify({'error': 'Invalid userType'}), 400
+
+        if patient_id:
+            query['patientId'] = ObjectId(patient_id)
 
         sessions = list(sessions_collection.find(query).sort('date', -1))
         return jsonify({'sessions': [to_json(s) for s in sessions]}), 200
         
+    except Exception as e:
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
+
+@app.route('/api/session/<session_id>', methods=['GET'])
+def get_session(session_id):
+    try:
+        session = sessions_collection.find_one({'sessionId': session_id})
+        if not session:
+            return jsonify({'error': 'Session not found'}), 404
+
+        return jsonify({'session': to_json(session)}), 200
+        
+    except Exception as e:
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
+
+@app.route('/api/user/<user_id>', methods=['GET'])
+def get_user_by_id(user_id):
+    """Get user details by user ID"""
+    try:
+        if not user_id:
+            return jsonify({'error': 'user_id is required'}), 400
+
+        # Validate if user_id is a valid ObjectId
+        if not ObjectId.is_valid(user_id):
+            return jsonify({'error': 'Invalid user ID format'}), 400
+
+        user = users_collection.find_one({'_id': ObjectId(user_id)})
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+
+        # Return user data without sensitive information
+        user_data = {
+            'id': str(user['_id']),
+            'name': user['name'],
+            'email': user.get('email', ''),
+            'userType': user.get('userType', ''),
+            'userCode': user.get('userCode', ''),
+            'createdAt': user.get('createdAt', '')
+        }
+
+        return jsonify({'user': user_data}), 200
+
     except Exception as e:
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
@@ -536,21 +640,8 @@ def get_user_by_code():
     except Exception as e:
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
-@app.route('/api/user/<user_id>', methods=['GET'])
-def get_user(user_id):
-    try:
-        user = users_collection.find_one({'_id': ObjectId(user_id)})
-        if not user:
-            return jsonify({'error': 'User not found'}), 404
-
-        return jsonify({'user': to_json(user)}), 200
-        
-    except Exception as e:
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
-    
 @app.route('/api/therapist/patient-games', methods=['GET'])
 def get_patient_games():
-    """Get all games configured for a specific patient"""
     try:
         patient_id = request.args.get('patientId')
         therapist_id = request.args.get('therapistId')
@@ -558,7 +649,6 @@ def get_patient_games():
         if not patient_id or not therapist_id:
             return jsonify({'error': 'patientId and therapistId are required'}), 400
 
-        # Verify therapist has access to this patient
         therapist = therapists_collection.find_one({
             'userId': ObjectId(therapist_id),
             'patients': ObjectId(patient_id)
@@ -567,14 +657,12 @@ def get_patient_games():
         if not therapist:
             return jsonify({'error': 'Patient not found or access denied'}), 404
 
-        # Get patient's game configurations
         patient_games = patient_games_collection.find_one({
             'patientId': ObjectId(patient_id),
             'therapistId': ObjectId(therapist_id)
         })
 
         if not patient_games:
-            # Return default configurations if none exist
             default_configs = {
                 'bubble_game': GameConfig(
                     game_name='bubble_game',
@@ -583,10 +671,10 @@ def get_patient_games():
                     max_bubbles=10,
                     spawn_area={'x_min': -5, 'x_max': 5, 'y_min': 1, 'y_max': 5, 'z_min': -5, 'z_max': 5},
                     enabled=True
-                )
+                ).__dict__
             }
             return jsonify({
-                'games': {name: game_config_to_dict(config) for name, config in default_configs.items()}
+                'games': default_configs
             }), 200
 
         return jsonify({
@@ -598,7 +686,6 @@ def get_patient_games():
 
 @app.route('/api/therapist/update-patient-games', methods=['POST'])
 def update_patient_games():
-    """Update game configurations for a patient"""
     try:
         data = request.get_json()
         if not data:
@@ -611,7 +698,6 @@ def update_patient_games():
         if not therapist_id or not patient_id:
             return jsonify({'error': 'therapistId and patientId are required'}), 400
 
-        # Verify therapist has access to this patient
         therapist = therapists_collection.find_one({
             'userId': ObjectId(therapist_id),
             'patients': ObjectId(patient_id)
@@ -620,15 +706,12 @@ def update_patient_games():
         if not therapist:
             return jsonify({'error': 'Patient not found or access denied'}), 404
 
-        # Validate game configurations
         validated_configs = {}
         for game_name, config in game_configs.items():
             if config.get('enabled', True):
-                # Validate required fields for enabled games
                 if not all(key in config for key in ['difficulty', 'target_score', 'max_bubbles', 'spawn_area']):
                     return jsonify({'error': f'Missing required fields for {game_name}'}), 400
                 
-                # Validate spawn area
                 spawn_area = config['spawn_area']
                 required_keys = ['x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max']
                 if not all(key in spawn_area for key in required_keys):
@@ -636,7 +719,6 @@ def update_patient_games():
 
             validated_configs[game_name] = config
 
-        # Update or create patient game configurations
         patient_games_collection.update_one(
             {
                 'patientId': ObjectId(patient_id),
@@ -658,7 +740,6 @@ def update_patient_games():
 
 @app.route('/api/patient/game-config', methods=['GET'])
 def get_patient_game_config():
-    """Get game configuration for a specific patient and game"""
     try:
         patient_id = request.args.get('patientId')
         game_name = request.args.get('gameName', 'bubble_game')
@@ -666,13 +747,11 @@ def get_patient_game_config():
         if not patient_id:
             return jsonify({'error': 'patientId is required'}), 400
 
-        # Get patient's game configurations
         patient_games = patient_games_collection.find_one({
             'patientId': ObjectId(patient_id)
         })
 
         if not patient_games:
-            # Return default configuration if none exists
             default_config = GameConfig(
                 game_name=game_name,
                 difficulty='medium',
@@ -681,7 +760,7 @@ def get_patient_game_config():
                 spawn_area={'x_min': -5, 'x_max': 5, 'y_min': 1, 'y_max': 5, 'z_min': -5, 'z_max': 5},
                 enabled=True
             )
-            return jsonify({'config': game_config_to_dict(default_config)}), 200
+            return jsonify({'config': default_config.__dict__}), 200
 
         config_data = patient_games.get('game_configs', {}).get(game_name)
         
@@ -698,11 +777,9 @@ def get_patient_game_config():
 
 @app.route('/api/therapist/available-games', methods=['GET'])
 def get_available_games():
-    """Get list of all available games for therapists to assign"""
     try:
         games = list(games_collection.find({'available': True}))
         
-        # Add default games if none exist
         if not games:
             default_games = [
                 {
@@ -733,7 +810,88 @@ def get_available_games():
     except Exception as e:
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
-# PPO Model Endpoint - Updated for Unity compatibility
+@app.route('/api/therapist/instructors', methods=['GET'])
+def get_instructors():
+    try:
+        instructors = list(instructors_collection.find({}))
+        return jsonify({'instructors': [to_json(instructor) for instructor in instructors]}), 200
+        
+    except Exception as e:
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
+
+@app.route('/api/therapist/create-report', methods=['POST'])
+def create_report():
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+            
+        therapist_id = data.get('therapistId')
+        patient_id = data.get('patientId')
+        report_data = data.get('reportData', {})
+        session_ids = data.get('sessionIds', [])
+
+        if not therapist_id or not patient_id:
+            return jsonify({'error': 'therapistId and patientId are required'}), 400
+
+        therapist = therapists_collection.find_one({
+            'userId': ObjectId(therapist_id),
+            'patients': ObjectId(patient_id)
+        })
+        
+        if not therapist:
+            return jsonify({'error': 'Patient not found or access denied'}), 404
+
+        report = {
+            'therapistId': ObjectId(therapist_id),
+            'patientId': ObjectId(patient_id),
+            'reportData': report_data,
+            'sessionIds': [ObjectId(sid) for sid in session_ids],
+            'createdAt': datetime.now(timezone.utc)
+        }
+
+        result = reports_collection.insert_one(report)
+        report_id = result.inserted_id
+
+        return jsonify({
+            'message': 'Report created successfully',
+            'reportId': str(report_id)
+        }), 201
+        
+    except Exception as e:
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
+
+@app.route('/api/therapist/reports', methods=['GET'])
+def get_reports():
+    try:
+        therapist_id = request.args.get('therapistId')
+        patient_id = request.args.get('patientId')
+        
+        if not therapist_id:
+            return jsonify({'error': 'therapistId is required'}), 400
+
+        query = {'therapistId': ObjectId(therapist_id)}
+        if patient_id:
+            query['patientId'] = ObjectId(patient_id)
+
+        reports = list(reports_collection.find(query).sort('createdAt', -1))
+        return jsonify({'reports': [to_json(report) for report in reports]}), 200
+        
+    except Exception as e:
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
+
+@app.route('/api/report/<report_id>', methods=['GET'])
+def get_report(report_id):
+    try:
+        report = reports_collection.find_one({'_id': ObjectId(report_id)})
+        if not report:
+            return jsonify({'error': 'Report not found'}), 404
+
+        return jsonify({'report': to_json(report)}), 200
+        
+    except Exception as e:
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
+
 @app.route("/ppo_action", methods=["POST"])
 def ppo_action():
     try:
@@ -741,31 +899,22 @@ def ppo_action():
         if not data or "state" not in data:
             return jsonify({"error": "State is required"}), 400
             
-        # Get state from Unity request
         state_list = data["state"]
-        
-        # Convert to numpy array and ensure it has the correct shape
         state = np.array(state_list, dtype=np.float32)
         
-        # If state doesn't have exactly 11 dimensions, pad or truncate
         if len(state) < state_dim:
-            # Pad with zeros if state is shorter than expected
             state = np.pad(state, (0, state_dim - len(state)), mode='constant')
         elif len(state) > state_dim:
-            # Truncate if state is longer than expected
             state = state[:state_dim]
         
-        # Get action from PPO model
         action = ppo_model.get_action(state)
         
-        # Return action as list for Unity
         return jsonify({"action": action.tolist()})
         
     except Exception as e:
         print(f"Error in ppo_action: {str(e)}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
-# PPO Training Endpoint
 @app.route("/api/ppo_train", methods=["POST"])
 def ppo_train():
     try:
@@ -775,7 +924,6 @@ def ppo_train():
             
         transitions = data["transitions"]
         
-        # Store transitions in memory
         for transition in transitions:
             state = np.array(transition["state"], dtype=np.float32)
             action = np.array(transition["action"], dtype=np.float32)
@@ -785,18 +933,15 @@ def ppo_train():
             
             ppo_model.store_transition(state, action, reward, next_state, done)
         
-        # Update the model
         ppo_model.update()
         
         return jsonify({"message": "Training completed successfully"})
     except Exception as e:
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
-# Endpoint for Unity integration
 @app.route('/usercodeunity', methods=['POST'])
 def usercode_unity():
     try:
-        # Support both form data and JSON
         if request.is_json:
             data = request.get_json()
             user_code = data.get('usercode') or data.get('userCode')
@@ -812,7 +957,6 @@ def usercode_unity():
         if not user:
             return jsonify({'error': 'User not found'}), 404
 
-        # Get game configuration for this patient
         game_config = None
         if user['userType'] == 'patient':
             patient_games = patient_games_collection.find_one({
@@ -824,7 +968,6 @@ def usercode_unity():
                 if config_data and config_data.get('enabled', True):
                     game_config = config_data
 
-        # If no specific configuration, use defaults
         if not game_config:
             game_config = {
                 'difficulty': 'medium',
@@ -833,10 +976,8 @@ def usercode_unity():
                 'spawn_area': {'x_min': -5, 'x_max': 5, 'y_min': 1, 'y_max': 5, 'z_min': -5, 'z_max': 5}
             }
 
-        # Get available games
         games = list(games_collection.find({'available': True}))
         
-        # If no games in database, return some default games
         if not games:
             games = [
                 {'name': 'Memory Match', 'description': 'Improve memory skills', 'difficulty': 'easy'},
@@ -869,12 +1010,10 @@ def therapist_defined_limit():
         if not user_code:
             return jsonify({"error": "usercode is required"}), 400
 
-        # Find user
         user = users_collection.find_one({'userCode': user_code})
         if not user:
             return jsonify({"error": "User not found"}), 404
 
-        # Get game configuration for this patient
         if user['userType'] == 'patient':
             patient_games = patient_games_collection.find_one({
                 'patientId': user['_id']
@@ -888,7 +1027,6 @@ def therapist_defined_limit():
                         "limits": config_data
                     }), 200
 
-        # Return default limits if no specific configuration found
         default_limits = {
             "targetScore": 20,
             "maxBubbles": 10,
@@ -900,17 +1038,14 @@ def therapist_defined_limit():
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
-# Health check endpoint
 @app.route('/api/health', methods=['GET'])
 def health_check():
     try:
-        # Test database connection
         client.admin.command('ismaster')
         return jsonify({'status': 'healthy', 'database': 'connected'}), 200
     except Exception as e:
         return jsonify({'status': 'unhealthy', 'database': 'disconnected', 'error': str(e)}), 500
 
-# Initialize some sample games if collection is empty
 def initialize_sample_games():
     if games_collection.count_documents({}) == 0:
         sample_games = [
@@ -956,8 +1091,5 @@ def initialize_sample_games():
 # Run the app
 # -----------------------
 if __name__ == '__main__':
-    # Initialize sample data
     initialize_sample_games()
-    
-    # Run the application with reloader disabled to avoid socket issues
     app.run(debug=True, host='0.0.0.0', port=5000, use_reloader=False)
