@@ -154,6 +154,21 @@ class CustomPPO:
         self.clip_epsilon = clip_epsilon
         self.memory = deque(maxlen=10000)
     
+    def update_alpha(self, new_lr):
+        for param_group in self.policy_optimizer.param_groups:
+            param_group['lr'] = new_lr
+        for param_group in self.value_optimizer.param_groups:
+            param_group['lr'] = new_lr
+
+    def get_alpha(self):
+        return self.policy_optimizer.param_groups[0]['lr']
+
+    def update_gamma(self, new_gamma):
+        self.gamma = new_gamma
+    
+    def get_gamma(self):
+        return self.gamma
+    
     def process_actions(self, raw_actions):
         processed = np.zeros_like(raw_actions)
 
@@ -957,6 +972,16 @@ def ppo_action():
             
         state_list = data["state"]
         state = np.array(state_list, dtype=np.float32)
+
+        fatigue = data.get("fatigue", 0.0)
+        success = data.get("success", 0.0)
+        engagement = data.get("engagement", 0.0)
+
+        gamma = ppo_model.get_gamma() * (1 - fatigue) * engagement * success
+        alpha = ppo_model.get_alpha() * (1 - fatigue) * engagement
+
+        ppo_model.update_gamma(gamma)
+        ppo_model.update_alpha(alpha)
         
         if len(state) < state_dim:
             state = np.pad(state, (0, state_dim - len(state)), mode='constant')
