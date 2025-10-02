@@ -120,15 +120,21 @@ class PolicyNetwork(nn.Module):
         super(PolicyNetwork, self).__init__()
         self.fc1 = nn.Linear(state_dim, 64)
         self.fc2 = nn.Linear(64, 64)
-        self.fc3 = nn.Linear(64, action_dim)
+        self.mean_layer = nn.Linear(64, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(action_dim))  # trainable log std
         self.relu = nn.ReLU()
-        self.tanh = nn.Tanh()
-        
+
     def forward(self, x):
         x = self.relu(self.fc1(x))
         x = self.relu(self.fc2(x))
-        x = self.tanh(self.fc3(x))
-        return x
+        mean = self.mean_layer(x)
+        log_std = self.log_std.expand_as(mean)
+        std = torch.exp(log_std)
+        return mean, std
+
+    def get_dist(self, state):
+        mean, std = self.forward(state)
+        return torch.distributions.Normal(mean, std)
 
 class ValueNetwork(nn.Module):
     def __init__(self, state_dim):
@@ -137,12 +143,11 @@ class ValueNetwork(nn.Module):
         self.fc2 = nn.Linear(64, 64)
         self.fc3 = nn.Linear(64, 1)
         self.relu = nn.ReLU()
-        
+
     def forward(self, x):
         x = self.relu(self.fc1(x))
         x = self.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
+        return self.fc3(x)
 
 class CustomPPO:
     def __init__(self, state_dim, action_dim, lr=3e-4, gamma=0.99, clip_epsilon=0.2):
@@ -153,7 +158,7 @@ class CustomPPO:
         self.gamma = gamma
         self.clip_epsilon = clip_epsilon
         self.memory = deque(maxlen=10000)
-    
+
     def update_alpha(self, new_lr):
         for param_group in self.policy_optimizer.param_groups:
             param_group['lr'] = new_lr
@@ -165,81 +170,90 @@ class CustomPPO:
 
     def update_gamma(self, new_gamma):
         self.gamma = new_gamma
-    
+
     def get_gamma(self):
         return self.gamma
-    
+
     def process_actions(self, raw_actions):
         processed = np.zeros_like(raw_actions)
 
         ranges = {
             0: (0, 5),    # spawnAreaSize
-            1: (0, 10),    # bubbleSpeedAction
-            2: (1, 10),    # bubbleLifetime
-            3: (0, 20),    # spawnHeight
-            4: (1, 20),    # numBubbles (int)
-            5: (0.1, 5),   # bubbleSize # guidanceOn is handled separately
+            1: (0, 10),   # bubbleSpeedAction
+            2: (1, 10),   # bubbleLifetime
+            3: (0, 20),   # spawnHeight
+            4: (1, 20),   # numBubbles (int)
+            5: (0.1, 5),  # bubbleSize
         }
 
-        for i in range(6):  # first 6 are continuous
+        for i in range(6):
             low, high = ranges[i]
             processed[i] = low + (raw_actions[i] + 1) * 0.5 * (high - low)
 
-        # integer rounding
-        processed[4] = int(round(processed[4]))
-        # boolean flag
-        processed[6] = 1 if raw_actions[6] > 0 else 0
-
+        processed[4] = int(round(processed[4]))   # integer
+        processed[6] = 1 if raw_actions[6] > 0 else 0  # boolean
         return processed
-        
+
     def get_action(self, state):
         device = next(self.policy_net.parameters()).device
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-        with torch.no_grad():
-            raw_action = self.policy_net(state_tensor)
-        raw_action = raw_action.squeeze(0).cpu().numpy()
 
-        # 🔑 Scale into valid Unity values before returning
-        return self.process_actions(raw_action)
-    
-    def store_transition(self, state, action, reward, next_state, done):
-        self.memory.append((state, action, reward, next_state, done))
-    
+        dist = self.policy_net.get_dist(state_tensor)
+        action = dist.sample()
+        log_prob = dist.log_prob(action).sum(dim=1)
+
+        raw_action = torch.tanh(action).squeeze(0).cpu().numpy()
+        processed_action = self.process_actions(raw_action)
+
+        return processed_action, log_prob.item()
+
+    def store_transition(self, state, action, reward, next_state, done, log_prob):
+        self.memory.append((state, action, reward, next_state, done, log_prob))
+
     def update(self, batch_size=64, epochs=10):
         if len(self.memory) < batch_size:
             return
-        
+
         device = next(self.policy_net.parameters()).device
-        
-        states, actions, rewards, next_states, dones = zip(*self.memory)
-        
+        states, actions, rewards, next_states, dones, old_log_probs = zip(*self.memory)
+
         states = torch.FloatTensor(np.array(states)).to(device)
         actions = torch.FloatTensor(np.array(actions)).to(device)
         rewards = torch.FloatTensor(np.array(rewards)).to(device)
         next_states = torch.FloatTensor(np.array(next_states)).to(device)
         dones = torch.FloatTensor(np.array(dones)).to(device)
-        
+        old_log_probs = torch.FloatTensor(np.array(old_log_probs)).to(device)
+
+        # Compute targets and advantages
         with torch.no_grad():
             values = self.value_net(states).squeeze()
             next_values = self.value_net(next_states).squeeze()
-            advantages = rewards + self.gamma * next_values * (1 - dones) - values
-        
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
+            targets = rewards + self.gamma * next_values * (1 - dones)
+            advantages = targets - values
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
         for _ in range(epochs):
-            current_actions = self.policy_net(states)
-            policy_loss = -torch.mean(torch.sum(current_actions * advantages.unsqueeze(1), dim=1))
-            
-            value_loss = nn.MSELoss()(self.value_net(states).squeeze(), rewards + self.gamma * next_values * (1 - dones))
-            
+            dist = self.policy_net.get_dist(states)
+            log_probs = dist.log_prob(actions).sum(dim=1)
+            ratios = torch.exp(log_probs - old_log_probs)
+
+            # Clipped surrogate loss
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages
+            policy_loss = -torch.mean(torch.min(surr1, surr2))
+
+            # Value function loss
+            value_loss = nn.MSELoss()(self.value_net(states).squeeze(), targets)
+
+            # Optimize
             self.policy_optimizer.zero_grad()
             policy_loss.backward()
             self.policy_optimizer.step()
-            
+
             self.value_optimizer.zero_grad()
             value_loss.backward()
             self.value_optimizer.step()
-        
+
         self.memory.clear()
 
 # Initialize PPO model
@@ -969,7 +983,7 @@ def ppo_action():
         data = request.get_json()
         if not data or "state" not in data:
             return jsonify({"error": "State is required"}), 400
-            
+
         state_list = data["state"]
         state = np.array(state_list, dtype=np.float32)
 
@@ -982,16 +996,16 @@ def ppo_action():
 
         ppo_model.update_gamma(gamma)
         ppo_model.update_alpha(alpha)
-        
+
         if len(state) < state_dim:
             state = np.pad(state, (0, state_dim - len(state)), mode='constant')
         elif len(state) > state_dim:
             state = state[:state_dim]
-        
-        action = ppo_model.get_action(state)
-        
-        return jsonify({"action": action.tolist()})
-        
+
+        action, log_prob = ppo_model.get_action(state)
+
+        return jsonify({"action": action.tolist(), "log_prob": log_prob})
+
     except Exception as e:
         print(f"Error in ppo_action: {str(e)}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
@@ -1002,22 +1016,21 @@ def ppo_train():
         data = request.get_json()
         if not data or "transitions" not in data:
             return jsonify({"error": "Transitions are required"}), 400
-            
+
         transitions = data["transitions"]
-        
+
         for transition in transitions:
             state = np.array(transition["state"], dtype=np.float32)
             action = np.array(transition["action"], dtype=np.float32)
             reward = transition["reward"]
             next_state = np.array(transition["next_state"], dtype=np.float32)
-            
-            # 🔹 Use .get() with default False for done
             done = transition.get("done", False)
-            
-            ppo_model.store_transition(state, action, reward, next_state, done)
-        
+            log_prob = transition.get("log_prob", 0.0)
+
+            ppo_model.store_transition(state, action, reward, next_state, done, log_prob)
+
         ppo_model.update()
-        
+
         return jsonify({"message": "Training completed successfully"})
     except Exception as e:
         print(f"Error in ppo_train: {str(e)}")
