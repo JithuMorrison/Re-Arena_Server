@@ -261,6 +261,34 @@ state_dim = 11
 action_dim = 7
 ppo_model = CustomPPO(state_dim, action_dim)
 
+MODEL_PATH = "ppo_model.pth"
+
+def save_model():
+    checkpoint = {
+        "policy_state_dict": ppo_model.policy_net.state_dict(),
+        "value_state_dict": ppo_model.value_net.state_dict(),
+        "policy_optimizer": ppo_model.policy_optimizer.state_dict(),
+        "value_optimizer": ppo_model.value_optimizer.state_dict(),
+        "gamma": ppo_model.gamma,
+        "clip_epsilon": ppo_model.clip_epsilon,
+    }
+    torch.save(checkpoint, MODEL_PATH)
+
+def load_model():
+    if os.path.exists(MODEL_PATH):
+        checkpoint = torch.load(MODEL_PATH, map_location="cpu")
+        ppo_model.policy_net.load_state_dict(checkpoint["policy_state_dict"])
+        ppo_model.value_net.load_state_dict(checkpoint["value_state_dict"])
+        ppo_model.policy_optimizer.load_state_dict(checkpoint["policy_optimizer"])
+        ppo_model.value_optimizer.load_state_dict(checkpoint["value_optimizer"])
+        ppo_model.gamma = checkpoint["gamma"]
+        ppo_model.clip_epsilon = checkpoint["clip_epsilon"]
+        print("✅ PPO Model loaded from file")
+    else:
+        print("⚠️ No saved model found, starting fresh")
+
+load_model()
+
 # -----------------------
 # Routes
 # -----------------------
@@ -1030,7 +1058,7 @@ def ppo_train():
             ppo_model.store_transition(state, action, reward, next_state, done, log_prob)
 
         ppo_model.update()
-
+        save_model()
         return jsonify({"message": "Training completed successfully"})
     except Exception as e:
         print(f"Error in ppo_train: {str(e)}")
