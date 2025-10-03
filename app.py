@@ -117,28 +117,25 @@ def is_valid_email(email: str) -> bool:
 # -----------------------
 class PolicyNetwork(nn.Module):
     def __init__(self, state_dim, action_dim):
-        super(PolicyNetwork, self).__init__()
+        super().__init__()
         self.fc1 = nn.Linear(state_dim, 64)
         self.fc2 = nn.Linear(64, 64)
-        self.mean_layer = nn.Linear(64, action_dim)
-        self.log_std = nn.Parameter(torch.zeros(action_dim))  # trainable log std
+        self.action_head = nn.Linear(64, action_dim)
         self.relu = nn.ReLU()
 
     def forward(self, x):
         x = self.relu(self.fc1(x))
         x = self.relu(self.fc2(x))
-        mean = self.mean_layer(x)
-        log_std = self.log_std.expand_as(mean)
-        std = torch.exp(log_std)
-        return mean, std
+        logits = self.action_head(x)
+        return logits
 
     def get_dist(self, state):
-        mean, std = self.forward(state)
-        return torch.distributions.Normal(mean, std)
+        logits = self.forward(state)
+        return torch.distributions.Categorical(logits=logits)
 
 class ValueNetwork(nn.Module):
     def __init__(self, state_dim):
-        super(ValueNetwork, self).__init__()
+        super().__init__()
         self.fc1 = nn.Linear(state_dim, 64)
         self.fc2 = nn.Linear(64, 64)
         self.fc3 = nn.Linear(64, 1)
@@ -174,38 +171,41 @@ class CustomPPO:
     def get_gamma(self):
         return self.gamma
 
-    def process_actions(self, raw_actions):
-        processed = np.zeros_like(raw_actions)
-
-        ranges = {
-            0: (0, 5),    # spawnAreaSize
-            1: (0, 10),   # bubbleSpeedAction
-            2: (1, 10),   # bubbleLifetime
-            3: (0, 20),   # spawnHeight
-            4: (1, 20),   # numBubbles (int)
-            5: (0.1, 5),  # bubbleSize
+    def process_actions(self, action_index):
+        delta_size = 0.2
+        delta_prob = 0.05
+        delta_spawn_rate = 1
+        adjustments = {
+            "bubble_size": 0.0,
+            "negative_prob": 0.0,
+            "positive_prob": 0.0,
+            "spawn_rate": 0.0,
         }
-
-        for i in range(6):
-            low, high = ranges[i]
-            processed[i] = low + (raw_actions[i] + 1) * 0.5 * (high - low)
-
-        processed[4] = int(round(processed[4]))   # integer
-        processed[6] = 1 if raw_actions[6] > 0 else 0  # boolean
-        return processed
+        if action_index == 0:
+            adjustments["bubble_size"] += delta_size
+        elif action_index == 1:
+            adjustments["bubble_size"] -= delta_size
+        elif action_index == 2:
+            adjustments["negative_prob"] += delta_prob
+        elif action_index == 3:
+            adjustments["negative_prob"] -= delta_prob
+        elif action_index == 4:
+            adjustments["positive_prob"] += delta_prob
+        elif action_index == 5:
+            adjustments["positive_prob"] -= delta_prob
+        elif action_index == 6:
+            adjustments["spawn_rate"] += delta_spawn_rate
+        elif action_index == 7:
+            adjustments["spawn_rate"] -= delta_spawn_rate
+        return adjustments
 
     def get_action(self, state):
         device = next(self.policy_net.parameters()).device
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-
         dist = self.policy_net.get_dist(state_tensor)
         action = dist.sample()
-        log_prob = dist.log_prob(action).sum(dim=1)
-
-        raw_action = torch.tanh(action).squeeze(0).cpu().numpy()
-        processed_action = self.process_actions(raw_action)
-
-        return processed_action, log_prob.item()
+        log_prob = dist.log_prob(action)
+        return action.item(), log_prob.item()
 
     def store_transition(self, state, action, reward, next_state, done, log_prob):
         self.memory.append((state, action, reward, next_state, done, log_prob))
@@ -213,52 +213,38 @@ class CustomPPO:
     def update(self, batch_size=64, epochs=10):
         if len(self.memory) < batch_size:
             return
-
         device = next(self.policy_net.parameters()).device
         states, actions, rewards, next_states, dones, old_log_probs = zip(*self.memory)
-
         states = torch.FloatTensor(np.array(states)).to(device)
-        actions = torch.FloatTensor(np.array(actions)).to(device)
+        actions = torch.LongTensor(np.array(actions)).to(device)
         rewards = torch.FloatTensor(np.array(rewards)).to(device)
         next_states = torch.FloatTensor(np.array(next_states)).to(device)
         dones = torch.FloatTensor(np.array(dones)).to(device)
         old_log_probs = torch.FloatTensor(np.array(old_log_probs)).to(device)
-
-        # Compute targets and advantages
         with torch.no_grad():
             values = self.value_net(states).squeeze()
             next_values = self.value_net(next_states).squeeze()
             targets = rewards + self.gamma * next_values * (1 - dones)
             advantages = targets - values
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
         for _ in range(epochs):
             dist = self.policy_net.get_dist(states)
-            log_probs = dist.log_prob(actions).sum(dim=1)
+            log_probs = dist.log_prob(actions)
             ratios = torch.exp(log_probs - old_log_probs)
-
-            # Clipped surrogate loss
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages
             policy_loss = -torch.mean(torch.min(surr1, surr2))
-
-            # Value function loss
             value_loss = nn.MSELoss()(self.value_net(states).squeeze(), targets)
-
-            # Optimize
             self.policy_optimizer.zero_grad()
             policy_loss.backward()
             self.policy_optimizer.step()
-
             self.value_optimizer.zero_grad()
             value_loss.backward()
             self.value_optimizer.step()
-
         self.memory.clear()
 
-# Initialize PPO model
-state_dim = 11
-action_dim = 7
+state_dim = 7
+action_dim = 8
 ppo_model = CustomPPO(state_dim, action_dim)
 
 MODEL_PATH = "ppo_model.pth"
@@ -283,9 +269,9 @@ def load_model():
         ppo_model.value_optimizer.load_state_dict(checkpoint["value_optimizer"])
         ppo_model.gamma = checkpoint["gamma"]
         ppo_model.clip_epsilon = checkpoint["clip_epsilon"]
-        print("✅ PPO Model loaded from file")
+        print("✅ PPO Model loaded")
     else:
-        print("⚠️ No saved model found, starting fresh")
+        print("⚠️ No saved model found")
 
 load_model()
 
@@ -1030,13 +1016,15 @@ def ppo_action():
         elif len(state) > state_dim:
             state = state[:state_dim]
 
-        action, log_prob = ppo_model.get_action(state)
+        action_index, log_prob = ppo_model.get_action(state)
+        adjustments = ppo_model.process_actions(action_index)
 
-        return jsonify({"action": action.tolist(), "log_prob": log_prob})
+        return jsonify({"action_index": action_index, "adjustments": adjustments, "log_prob": log_prob})
 
     except Exception as e:
         print(f"Error in ppo_action: {str(e)}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
+
 
 @app.route("/ppo_train", methods=["POST"])
 def ppo_train():
@@ -1049,7 +1037,7 @@ def ppo_train():
 
         for transition in transitions:
             state = np.array(transition["state"], dtype=np.float32)
-            action = np.array(transition["action"], dtype=np.float32)
+            action = int(transition["action"])  # discrete
             reward = transition["reward"]
             next_state = np.array(transition["next_state"], dtype=np.float32)
             done = transition.get("done", False)
@@ -1060,6 +1048,7 @@ def ppo_train():
         ppo_model.update()
         save_model()
         return jsonify({"message": "Training completed successfully"})
+
     except Exception as e:
         print(f"Error in ppo_train: {str(e)}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
