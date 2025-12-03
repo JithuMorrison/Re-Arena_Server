@@ -4,6 +4,7 @@ from pymongo import MongoClient
 from bson import ObjectId
 import bcrypt
 import os
+import csv
 from dotenv import load_dotenv
 from datetime import datetime, timezone
 import random
@@ -1052,6 +1053,62 @@ def ppo_train():
     except Exception as e:
         print(f"Error in ppo_train: {str(e)}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
+    
+@app.route("/store_session_data", methods=["POST"])
+def store_session_data():
+    try:
+        data = request.get_json()
+
+        # Create folder if missing
+        folder = "csv_logs"
+        os.makedirs(folder, exist_ok=True)
+
+        # File name = today's date
+        file_path = os.path.join(folder, "session_log.csv")
+
+        # If file missing → write header
+        file_exists = os.path.isfile(file_path)
+
+        with open(file_path, "a", newline="") as f:
+            writer = csv.writer(f)
+
+            if not file_exists:
+                writer.writerow([
+                    "timestamp",
+                    "time",
+                    "state",
+                    "leftHand_x","leftHand_y","leftHand_z",
+                    "rightHand_x","rightHand_y","rightHand_z",
+                    "leftShoulder_x","leftShoulder_y","leftShoulder_z",
+                    "rightShoulder_x","rightShoulder_y","rightShoulder_z",
+                    "hip_x","hip_y","hip_z",
+                    "head_x","head_y","head_z",
+                    "fatigue",
+                    "engagement",
+                    "success"
+                ])
+
+            writer.writerow([
+                datetime.now().isoformat(),
+                data.get("time", 0),
+                data.get("state", []),
+
+                data["leftHand"]["x"], data["leftHand"]["y"], data["leftHand"]["z"],
+                data["rightHand"]["x"], data["rightHand"]["y"], data["rightHand"]["z"],
+                data["leftShoulder"]["x"], data["leftShoulder"]["y"], data["leftShoulder"]["z"],
+                data["rightShoulder"]["x"], data["rightShoulder"]["y"], data["rightShoulder"]["z"],
+                data["hip"]["x"], data["hip"]["y"], data["hip"]["z"],
+                data["head"]["x"], data["head"]["y"], data["head"]["z"],
+
+                data.get("fatigue", 0),
+                data.get("engagement", 0),
+                data.get("success", 0)
+            ])
+
+        return jsonify({"status": "saved"}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/usercodeunity', methods=['POST'])
 def usercode_unity():
