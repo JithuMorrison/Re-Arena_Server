@@ -813,7 +813,7 @@ def update_patient_games():
 
         validated_configs = {}
         for game_name, config in game_configs.items():
-            if config.get('enabled', True):
+            if config.get('enabled', True) and game_name == 'bubble_game':
                 if not all(key in config for key in ["difficulty", "spawnAreaSize", "bubbleSpeedAction", "bubbleLifetime", "spawnHeight", "numBubbles", "bubbleSize"]):
                     return jsonify({'error': f'Missing required fields for {game_name}'}), 400
 
@@ -1245,14 +1245,37 @@ def initialize_sample_games():
                 'createdAt': datetime.now(timezone.utc)
             },
             {
-                'name': 'memory_match',
-                'display_name': 'Memory Match',
-                'description': 'Match pairs of cards to improve memory',
-                'category': 'cognitive',
+                'name': 'ghost_catcher',
+                'display_name': 'Ghost Catcher',
+                'description': 'Catch ghosts to enhance focus and agility',
+                'category': 'motor_skills',
                 'configurable_fields': [
                     {'name': 'difficulty', 'type': 'select', 'options': ['easy', 'medium', 'hard'], 'default': 'easy'},
-                    {'name': 'grid_size', 'type': 'select', 'options': ['4x4', '6x6', '8x8'], 'default': '4x4'},
-                    {'name': 'time_limit', 'type': 'number', 'min': 30, 'max': 300, 'default': 120}
+                    {'name': 'target_score', 'type': 'number', 'min': 10, 'max': 30, 'default': 20},
+                    {'name': 'spawn_count', 'type': 'number', 'min': 1, 'max': 15, 'default': 5},
+                    {'name': 'time_delay', 'type': 'number', 'min': 3, 'max': 10, 'default': 5},
+                    {'name': 'lights_green_prob', 'type': 'object', 'fields': [
+                        {'name': 'lh', 'type': 'number', 'default': 0.4},
+                        {'name': 'll', 'type': 'number', 'default': 0.6},
+                        {'name': 'rl', 'type': 'number', 'default': 0.6},
+                        {'name': 'rh', 'type': 'number', 'default': 0.4}
+                    ]}
+                ],
+                'available': True,
+                'createdAt': datetime.now(timezone.utc)
+            },
+            {
+                'name': 'get_set_repeat',
+                'display_name': 'Get Set Repeat',
+                'description': 'Repeat the actions to boost coordination and attention',
+                'category': 'coordination',
+                'configurable_fields': [
+                    {'name': 'difficulty', 'type': 'select', 'options': ['easy', 'medium', 'hard'], 'default': 'easy'},
+                    {'name': 'target_score', 'type': 'number', 'min': 10, 'max': 30, 'default': 20},
+                    {'name': 'action_time_delay', 'type': 'number', 'min': 3, 'max': 10, 'default': 5},
+                    {'name': 'num_actions', 'type': 'number', 'min': 1, 'max': 15, 'default': 2},
+                    {'name': 'similarity_min', 'type': 'number', 'min': 40, 'max': 80, 'default': 65},
+                    {'name': 'similarity_max', 'type': 'number', 'min': 70, 'max': 100, 'default': 80}
                 ],
                 'available': True,
                 'createdAt': datetime.now(timezone.utc)
