@@ -923,74 +923,129 @@ def get_instructors():
 def create_report():
     try:
         data = request.get_json()
+
         if not data:
             return jsonify({'error': 'No data provided'}), 400
-            
+
         therapist_id = data.get('therapistId')
         patient_id = data.get('patientId')
+        therapist_name = data.get('therapistName')
         report_data = data.get('reportData', {})
         session_ids = data.get('sessionIds', [])
 
         if not therapist_id or not patient_id:
             return jsonify({'error': 'therapistId and patientId are required'}), 400
 
+        # Validate therapist-patient access
         therapist = therapists_collection.find_one({
             'userId': ObjectId(therapist_id),
             'patients': ObjectId(patient_id)
         })
-        
+
         if not therapist:
             return jsonify({'error': 'Patient not found or access denied'}), 404
 
+        # Fetch sessions (similar to Node)
+        sessions = list(sessions_collection.find({
+            "_id": {"$in": [ObjectId(sid) for sid in session_ids]}
+        }))
+
+        # Convert sessions into Node-like structure
+        formatted_sessions = []
+        for s in sessions:
+            formatted_sessions.append({
+                "sessionId": str(s["_id"]),
+                "date": s.get("date"),
+                "gameData": s.get("gameData", {}),
+                "rating": s.get("rating"),
+                "review": s.get("review"),
+                "duration": s.get("duration")
+            })
+
+        # Prepare final report document (matching Node schema exactly)
         report = {
-            'therapistId': ObjectId(therapist_id),
-            'patientId': ObjectId(patient_id),
-            'reportData': report_data,
-            'sessionIds': [ObjectId(sid) for sid in session_ids],
-            'createdAt': datetime.now(timezone.utc)
+            "therapistId": therapist_id,
+            "patientId": patient_id,
+            "therapistName": therapist_name,
+            "reportData": {
+                "title": report_data.get("title"),
+                "summary": report_data.get("summary"),
+                "progress": report_data.get("progress"),
+                "recommendations": report_data.get("recommendations"),
+                "aiGenerated": report_data.get("aiGenerated", {})
+            },
+            "sessions": formatted_sessions,
+            "createdAt": datetime.now(timezone.utc),
+            "updatedAt": datetime.now(timezone.utc)
         }
 
         result = reports_collection.insert_one(report)
-        report_id = result.inserted_id
-
         return jsonify({
-            'message': 'Report created successfully',
-            'reportId': str(report_id)
+            "success": True,
+            "message": "Report created successfully",
+            "reportId": str(result.inserted_id)
         }), 201
-        
+
     except Exception as e:
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
+        print("Server error:", str(e))
+        return jsonify({'error': 'Server error: ' + str(e)}), 500
+
+
 
 @app.route('/api/therapist/reports', methods=['GET'])
 def get_reports():
     try:
         therapist_id = request.args.get('therapistId')
-        patient_id = request.args.get('patientId')
-        
+
         if not therapist_id:
             return jsonify({'error': 'therapistId is required'}), 400
 
-        query = {'therapistId': ObjectId(therapist_id)}
-        if patient_id:
-            query['patientId'] = ObjectId(patient_id)
+        reports = list(reports_collection.find(
+            {"therapistId": therapist_id}
+        ).sort("createdAt", -1))
 
-        reports = list(reports_collection.find(query).sort('createdAt', -1))
-        return jsonify({'reports': [to_json(report) for report in reports]}), 200
-        
+        # Convert ObjectId to string
+        for r in reports:
+            r["_id"] = str(r["_id"])
+
+        return jsonify({"success": True, "reports": reports}), 200
+
     except Exception as e:
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
+        return jsonify({'error': 'Server error: ' + str(e)}), 500
 
-@app.route('/api/report/<report_id>', methods=['GET'])
+
+
+@app.route('/api/therapist/report/<report_id>', methods=['GET'])
 def get_report(report_id):
     try:
-        report = reports_collection.find_one({'_id': ObjectId(report_id)})
-        if not report:
-            return jsonify({'error': 'Report not found'}), 404
+        therapist_id = request.args.get('therapistId')
 
-        return jsonify({'report': to_json(report)}), 200
-        
+        report = reports_collection.find_one({
+            "_id": ObjectId(report_id),
+            "therapistId": therapist_id
+        })
+
+        if not report:
+            return jsonify({"error": "Report not found"}), 404
+
+        report["_id"] = str(report["_id"])
+        return jsonify({"success": True, "report": report}), 200
+
     except Exception as e:
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
+        return jsonify({'error': 'Server error: ' + str(e)}), 500
+
+@app.route('/api/therapist/delete-report/<report_id>', methods=['DELETE'])
+def delete_report(report_id):
+    try:
+        result = reports_collection.delete_one({"_id": ObjectId(report_id)})
+
+        if result.deleted_count == 0:
+            return jsonify({"error": "Report not found"}), 404
+
+        return jsonify({"success": True, "message": "Report deleted successfully"}), 200
+
+    except Exception as e:
+        return jsonify({"error": "Server error: " + str(e)}), 500
 
 @app.route("/ppo_action", methods=["POST"])
 def ppo_action():
