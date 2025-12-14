@@ -698,6 +698,19 @@ def get_session(session_id):
         
     except Exception as e:
         return jsonify({'error': f'Server error: {str(e)}'}), 500
+    
+@app.route('/api/session/id/<id>', methods=['GET'])
+def get_session_id(id):
+    try:
+        session = sessions_collection.find_one({'_id': ObjectId(id)})
+        
+        if not session:
+            return jsonify({'error': 'Session not found'}), 404
+
+        return jsonify({'session': to_json(session)}), 200
+        
+    except Exception as e:
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 @app.route('/api/user/<user_id>', methods=['GET'])
 def get_user_by_id(user_id):
@@ -945,52 +958,145 @@ def create_report():
         if not therapist:
             return jsonify({'error': 'Patient not found or access denied'}), 404
 
-        # Fetch sessions (similar to Node)
+        # Fetch sessions
         sessions = list(sessions_collection.find({
             "_id": {"$in": [ObjectId(sid) for sid in session_ids]}
         }))
 
-        # Convert sessions into Node-like structure
+        # Convert sessions into structured format
         formatted_sessions = []
         for s in sessions:
             formatted_sessions.append({
-                "sessionId": str(s["_id"]),
+                "_id": str(s["_id"]),
+                "sessionId": s.get("sessionId", ""),
                 "date": s.get("date"),
                 "gameData": s.get("gameData", {}),
+                "analytics": s.get("analytics", {}),
                 "rating": s.get("rating"),
                 "review": s.get("review"),
-                "duration": s.get("duration")
+                "duration": s.get("duration"),
+                "status": s.get("status", "completed"),
+                "instructorId": s.get("instructorId"),
+                "endTime": s.get("endTime"),
+                "therapistId": s.get("therapistId"),
+                "patientId": s.get("patientId")
             })
 
-        # Prepare final report document (matching Node schema exactly)
+        # Extract unique instructor IDs from sessions
+        instructor_ids = []
+        for s in sessions:
+            if s.get('instructorId') and s['instructorId'] not in instructor_ids:
+                instructor_ids.append(s['instructorId'])
+
+        # Fetch instructor details
+        instructors_list = []
+        for instructor_id in instructor_ids:
+            try:
+                instructor = users_collection.find_one({"_id": ObjectId(instructor_id)})
+                if instructor:
+                    instructors_list.append({
+                        "_id": str(instructor["_id"]),
+                        "name": instructor.get("name", "Unknown Instructor"),
+                        "email": instructor.get("email", "No email"),
+                        "role": instructor.get("role", "Instructor")
+                    })
+            except Exception as e:
+                print(f"Error fetching instructor {instructor_id}: {str(e)}")
+
+        # Calculate instructor performance metrics
+        instructor_performance = []
+        for instructor in instructors_list:
+            instructor_sessions = [s for s in formatted_sessions if s.get('instructorId') == instructor['_id']]
+            
+            if instructor_sessions:
+                # Calculate averages
+                avg_score = sum(s.get('gameData', {}).get('score', 0) for s in instructor_sessions) / len(instructor_sessions)
+                avg_rating = sum(s.get('rating', 0) for s in instructor_sessions) / len(instructor_sessions)
+                
+                # Calculate movement averages
+                left_hand_sum = sum(s.get('gameData', {}).get('leftHandMaxFromHip', 0) for s in instructor_sessions)
+                right_hand_sum = sum(s.get('gameData', {}).get('rightHandMaxFromHip', 0) for s in instructor_sessions)
+                
+                instructor_performance.append({
+                    "instructorId": instructor['_id'],
+                    "instructorName": instructor['name'],
+                    "sessionsCount": len(instructor_sessions),
+                    "avgScore": round(avg_score, 1),
+                    "avgRating": round(avg_rating, 1),
+                    "avgLeftHand": round(left_hand_sum / len(instructor_sessions), 2) if len(instructor_sessions) > 0 else 0,
+                    "avgRightHand": round(right_hand_sum / len(instructor_sessions), 2) if len(instructor_sessions) > 0 else 0
+                })
+
+        # Prepare graph data
+        graph_data = {
+            "scoreTrend": [
+                {
+                    "date": s.get('date'),
+                    "score": s.get('gameData', {}).get('score', 0),
+                    "sessionNumber": idx + 1,
+                    "instructorName": next((i['name'] for i in instructors_list if i['_id'] == s.get('instructorId')), 'Unknown')
+                }
+                for idx, s in enumerate(formatted_sessions)
+            ],
+            "movementMetrics": [
+                {
+                    "date": s.get('date'),
+                    "leftHand": s.get('gameData', {}).get('leftHandMaxFromHip', 0),
+                    "rightHand": s.get('gameData', {}).get('rightHandMaxFromHip', 0),
+                    "leftLeg": s.get('gameData', {}).get('leftLegMax', 0),
+                    "rightLeg": s.get('gameData', {}).get('rightLegMax', 0),
+                    "instructorId": s.get('instructorId')
+                }
+                for s in formatted_sessions
+            ],
+            "gameConfig": [
+                {
+                    "date": s.get('date'),
+                    "bubbleSpeed": s.get('analytics', {}).get('bubbleSpeedAction', 0),
+                    "bubbleLifetime": s.get('analytics', {}).get('bubbleLifetime', 0),
+                    "bubbleSize": s.get('analytics', {}).get('bubbleSize', 0),
+                    "numBubbles": s.get('analytics', {}).get('numBubbles', 0),
+                    "spawnAreaSize": s.get('analytics', {}).get('spawnAreaSize', 0),
+                    "spawnHeight": s.get('analytics', {}).get('spawnHeight', 0),
+                    "instructorId": s.get('instructorId')
+                }
+                for s in formatted_sessions
+            ],
+            "instructorPerformance": instructor_performance
+        }
+
+        # Prepare final report document
         report = {
             "therapistId": therapist_id,
             "patientId": patient_id,
             "therapistName": therapist_name,
             "reportData": {
-                "title": report_data.get("title"),
-                "summary": report_data.get("summary"),
-                "progress": report_data.get("progress"),
-                "recommendations": report_data.get("recommendations"),
-                "aiGenerated": report_data.get("aiGenerated", {})
+                "title": report_data.get("title", ""),
+                "summary": report_data.get("summary", ""),
+                "progress": report_data.get("progress", ""),
+                "recommendations": report_data.get("recommendations", ""),
+                "aiGenerated": report_data.get("aiGenerated", {}),
+                "instructors": instructors_list,
+                "graphData": graph_data,
+                "instructorPerformance": instructor_performance
             },
             "sessions": formatted_sessions,
             "createdAt": datetime.now(timezone.utc),
-            "updatedAt": datetime.now(timezone.utc)
+            "updatedAt": datetime.now(timezone.utc),
+            "version": "2.0"  # Added version to track new format
         }
 
         result = reports_collection.insert_one(report)
+        
         return jsonify({
             "success": True,
-            "message": "Report created successfully",
+            "message": "Report created successfully with analytics",
             "reportId": str(result.inserted_id)
-        }), 201
+        }), 200
 
     except Exception as e:
         print("Server error:", str(e))
         return jsonify({'error': 'Server error: ' + str(e)}), 500
-
-
 
 @app.route('/api/therapist/reports', methods=['GET'])
 def get_reports():
@@ -1000,25 +1106,80 @@ def get_reports():
         if not therapist_id:
             return jsonify({'error': 'therapistId is required'}), 400
 
-        reports = list(reports_collection.find(
+        # Fetch reports for therapist
+        reports_cursor = reports_collection.find(
             {"therapistId": therapist_id}
-        ).sort("createdAt", -1))
+        ).sort("createdAt", -1)
 
-        # Convert ObjectId to string
-        for r in reports:
-            r["_id"] = str(r["_id"])
+        reports = []
+        for report in reports_cursor:
+            # Convert ObjectId to string
+            report["_id"] = str(report["_id"])
+            
+            # Convert all ObjectIds in the document to strings
+            report = convert_objectid_to_str(report)
+            
+            # Ensure reportData has all expected fields with defaults
+            report_data = report.get("reportData", {})
+            
+            if not isinstance(report_data, dict):
+                report_data = {}
+            
+            # Ensure all required fields exist
+            report["reportData"] = {
+                "title": report_data.get("title", ""),
+                "summary": report_data.get("summary", ""),
+                "progress": report_data.get("progress", ""),
+                "recommendations": report_data.get("recommendations", ""),
+                "aiGenerated": report_data.get("aiGenerated", {}),
+                "instructors": report_data.get("instructors", []),
+                "graphData": report_data.get("graphData", {}),
+                "instructorPerformance": report_data.get("instructorPerformance", [])
+            }
+            
+            # Convert ObjectIds in instructors list
+            if isinstance(report["reportData"]["instructors"], list):
+                for instructor in report["reportData"]["instructors"]:
+                    if isinstance(instructor, dict) and "_id" in instructor and isinstance(instructor["_id"], ObjectId):
+                        instructor["_id"] = str(instructor["_id"])
+            
+            # Handle sessions array - convert all ObjectIds
+            if "sessions" in report and isinstance(report["sessions"], list):
+                for session in report["sessions"]:
+                    if isinstance(session, dict):
+                        # Convert _id if it exists
+                        if "_id" in session and isinstance(session["_id"], ObjectId):
+                            session["_id"] = str(session["_id"])
+                        # Convert other ObjectId fields
+                        if "instructorId" in session and isinstance(session["instructorId"], ObjectId):
+                            session["instructorId"] = str(session["instructorId"])
+                        if "therapistId" in session and isinstance(session["therapistId"], ObjectId):
+                            session["therapistId"] = str(session["therapistId"])
+                        if "patientId" in session and isinstance(session["patientId"], ObjectId):
+                            session["patientId"] = str(session["patientId"])
+            
+            reports.append(report)
 
         return jsonify({"success": True, "reports": reports}), 200
 
     except Exception as e:
+        print("Error fetching reports:", str(e))
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': 'Server error: ' + str(e)}), 500
-
 
 
 @app.route('/api/therapist/report/<report_id>', methods=['GET'])
 def get_report(report_id):
     try:
         therapist_id = request.args.get('therapistId')
+
+        if not therapist_id:
+            return jsonify({'error': 'therapistId is required'}), 400
+
+        # Validate ObjectId
+        if not ObjectId.is_valid(report_id):
+            return jsonify({"error": "Invalid report ID"}), 400
 
         report = reports_collection.find_one({
             "_id": ObjectId(report_id),
@@ -1028,11 +1189,78 @@ def get_report(report_id):
         if not report:
             return jsonify({"error": "Report not found"}), 404
 
+        # Convert ObjectId to string
         report["_id"] = str(report["_id"])
+        
+        # Convert all ObjectIds in the document to strings
+        report = convert_objectid_to_str(report)
+        
+        # Ensure reportData has all expected fields
+        report_data = report.get("reportData", {})
+        
+        if not isinstance(report_data, dict):
+            report_data = {}
+        
+        # Create complete reportData structure
+        report["reportData"] = {
+            "title": report_data.get("title", ""),
+            "summary": report_data.get("summary", ""),
+            "progress": report_data.get("progress", ""),
+            "recommendations": report_data.get("recommendations", ""),
+            "aiGenerated": report_data.get("aiGenerated", {}),
+            "instructors": report_data.get("instructors", []),
+            "graphData": report_data.get("graphData", {}),
+            "instructorPerformance": report_data.get("instructorPerformance", [])
+        }
+        
+        # Convert ObjectIds in instructors list
+        if isinstance(report["reportData"]["instructors"], list):
+            for instructor in report["reportData"]["instructors"]:
+                if isinstance(instructor, dict) and "_id" in instructor and isinstance(instructor["_id"], ObjectId):
+                    instructor["_id"] = str(instructor["_id"])
+        
+        # Handle sessions array
+        if "sessions" in report and isinstance(report["sessions"], list):
+            for session in report["sessions"]:
+                if isinstance(session, dict):
+                    # Convert ObjectId fields
+                    if "_id" in session and isinstance(session["_id"], ObjectId):
+                        session["_id"] = str(session["_id"])
+                    if "instructorId" in session and isinstance(session["instructorId"], ObjectId):
+                        session["instructorId"] = str(session["instructorId"])
+                    if "therapistId" in session and isinstance(session["therapistId"], ObjectId):
+                        session["therapistId"] = str(session["therapistId"])
+                    if "patientId" in session and isinstance(session["patientId"], ObjectId):
+                        session["patientId"] = str(session["patientId"])
+                    
+                    # Ensure nested objects exist
+                    if not session.get("gameData"):
+                        session["gameData"] = {}
+                    if not session.get("analytics"):
+                        session["analytics"] = {}
+
         return jsonify({"success": True, "report": report}), 200
 
     except Exception as e:
+        print("Error fetching report:", str(e))
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': 'Server error: ' + str(e)}), 500
+
+
+# Helper function to convert ObjectIds to strings recursively
+def convert_objectid_to_str(obj):
+    if isinstance(obj, ObjectId):
+        return str(obj)
+    elif isinstance(obj, dict):
+        new_dict = {}
+        for key, value in obj.items():
+            new_dict[key] = convert_objectid_to_str(value)
+        return new_dict
+    elif isinstance(obj, list):
+        return [convert_objectid_to_str(item) for item in obj]
+    else:
+        return obj
 
 @app.route('/api/therapist/delete-report/<report_id>', methods=['DELETE'])
 def delete_report(report_id):
