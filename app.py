@@ -277,6 +277,213 @@ def load_model():
 load_model()
 
 # -----------------------
+# DQN Implementation
+# -----------------------
+
+class DQNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.fc3 = nn.Linear(128, 64)
+        self.fc4 = nn.Linear(64, action_dim)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        x = self.relu(self.fc3(x))
+        return self.fc4(x)
+
+class CustomDQN:
+    def __init__(self, state_dim, action_dim, lr=1e-3, gamma=0.99, epsilon=1.0, epsilon_decay=0.995, epsilon_min=0.01):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_decay = epsilon_decay
+        self.epsilon_min = epsilon_min
+        
+        # Main and target networks
+        self.q_network = DQNetwork(state_dim, action_dim)
+        self.target_network = DQNetwork(state_dim, action_dim)
+        self.update_target_network()
+        
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
+        self.memory = deque(maxlen=10000)
+        self.batch_size = 64
+
+    def update_target_network(self):
+        """Copy weights from Q-network to target network"""
+        self.target_network.load_state_dict(self.q_network.state_dict())
+
+    def update_lr(self, new_lr):
+        """Update learning rate"""
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = new_lr
+
+    def get_lr(self):
+        """Get current learning rate"""
+        return self.optimizer.param_groups[0]['lr']
+
+    def update_gamma(self, new_gamma):
+        """Update discount factor"""
+        self.gamma = new_gamma
+
+    def get_gamma(self):
+        """Get current discount factor"""
+        return self.gamma
+
+    def process_actions(self, action_index):
+        """
+        Convert action index to environment adjustments
+        Actions:
+        0-3: Set light 0-3 to Red
+        4-7: Set light 0-3 to Orange
+        8-11: Set light 0-3 to Green
+        12-13: Increase/Decrease light change speed
+        14-15: Increase/Decrease spawn rate
+        """
+        delta_speed = 0.2
+        delta_spawn = 0.5
+        
+        adjustments = {
+            "light_states": [-1, -1, -1, -1],  # -1 means no change, 0=Red, 1=Orange, 2=Green
+            "light_speed_change": 0.0,
+            "spawn_rate_change": 0.0,
+        }
+        
+        # Light state changes (0-11)
+        if action_index < 12:
+            light_index = action_index % 4
+            light_state = action_index // 4
+            adjustments["light_states"][light_index] = light_state
+        # Light speed changes (12-13)
+        elif action_index == 12:
+            adjustments["light_speed_change"] = -delta_speed  # Decrease (faster changes)
+        elif action_index == 13:
+            adjustments["light_speed_change"] = delta_speed   # Increase (slower changes)
+        # Spawn rate changes (14-15)
+        elif action_index == 14:
+            adjustments["spawn_rate_change"] = -delta_spawn   # Spawn faster
+        elif action_index == 15:
+            adjustments["spawn_rate_change"] = delta_spawn    # Spawn slower
+        
+        return adjustments
+
+    def get_action(self, state, training=True):
+        """
+        Epsilon-greedy action selection
+        Returns: action_index, q_value
+        """
+        device = next(self.q_network.parameters()).device
+        
+        # Exploration
+        if training and np.random.random() < self.epsilon:
+            action = np.random.randint(0, self.action_dim)
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+            with torch.no_grad():
+                q_values = self.q_network(state_tensor)
+                q_value = q_values[0, action].item()
+            return action, q_value
+        
+        # Exploitation
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+        with torch.no_grad():
+            q_values = self.q_network(state_tensor)
+            action = q_values.argmax(dim=1).item()
+            q_value = q_values[0, action].item()
+        
+        return action, q_value
+
+    def store_transition(self, state, action, reward, next_state, done):
+        """Store experience in replay buffer"""
+        self.memory.append((state, action, reward, next_state, done))
+
+    def update(self):
+        """Train the DQN using experience replay"""
+        if len(self.memory) < self.batch_size:
+            return {"loss": 0.0, "q_value": 0.0}
+        
+        device = next(self.q_network.parameters()).device
+        
+        # Sample random batch
+        batch = random.sample(self.memory, self.batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        
+        states = torch.FloatTensor(np.array(states)).to(device)
+        actions = torch.LongTensor(np.array(actions)).to(device)
+        rewards = torch.FloatTensor(np.array(rewards)).to(device)
+        next_states = torch.FloatTensor(np.array(next_states)).to(device)
+        dones = torch.FloatTensor(np.array(dones)).to(device)
+        
+        # Current Q values
+        current_q_values = self.q_network(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        
+        # Target Q values
+        with torch.no_grad():
+            next_q_values = self.target_network(next_states).max(1)[0]
+            target_q_values = rewards + self.gamma * next_q_values * (1 - dones)
+        
+        # Compute loss
+        loss = nn.MSELoss()(current_q_values, target_q_values)
+        
+        # Optimize
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        
+        # Decay epsilon
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+        
+        return {
+            "loss": loss.item(),
+            "q_value": current_q_values.mean().item(),
+            "epsilon": self.epsilon
+        }
+
+# State: [leftHand_active, leftLeg_active, rightLeg_active, rightHand_active,
+#         light0_state(0-2), light1_state, light2_state, light3_state,
+#         active_lanterns(0-5), score_normalized(-1 to 1)]
+state_dim = 10
+
+# Actions: 12 light changes + 2 speed changes + 2 spawn rate changes = 16 actions
+action_dim = 16
+
+dqn_model = CustomDQN(state_dim, action_dim)
+
+MODEL_PATH = "dqn_rogl_model.pth"
+
+def save_model_dqn():
+    """Save DQN model checkpoint"""
+    checkpoint = {
+        "q_network_state_dict": dqn_model.q_network.state_dict(),
+        "target_network_state_dict": dqn_model.target_network.state_dict(),
+        "optimizer_state_dict": dqn_model.optimizer.state_dict(),
+        "epsilon": dqn_model.epsilon,
+        "gamma": dqn_model.gamma,
+    }
+    torch.save(checkpoint, MODEL_PATH)
+    print(f"✅ DQN Model saved to {MODEL_PATH}")
+
+def load_model_dqn():
+    """Load DQN model checkpoint"""
+    if os.path.exists(MODEL_PATH):
+        checkpoint = torch.load(MODEL_PATH, map_location="cpu")
+        dqn_model.q_network.load_state_dict(checkpoint["q_network_state_dict"])
+        dqn_model.target_network.load_state_dict(checkpoint["target_network_state_dict"])
+        dqn_model.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        dqn_model.epsilon = checkpoint["epsilon"]
+        dqn_model.gamma = checkpoint["gamma"]
+        print("✅ DQN Model loaded successfully")
+    else:
+        print("⚠️ No saved model found, starting fresh")
+
+# Load model at startup
+load_model_dqn()
+
+# -----------------------
 # Routes
 # -----------------------
 @app.route('/api/register', methods=['POST'])
@@ -1386,6 +1593,178 @@ def store_session_data():
                 data.get("fatigue", 0),
                 data.get("engagement", 0),
                 data.get("success", 0)
+            ])
+
+        return jsonify({"status": "saved"}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+@app.route("/dqn_action", methods=["POST"])
+def dqn_action():
+    """
+    Receive state from Unity and return DQN action
+    Expected state format: [leftHand_active, leftLeg_active, rightLeg_active, rightHand_active,
+                           light0_state, light1_state, light2_state, light3_state,
+                           active_lanterns, score_normalized]
+    """
+    try:
+        data = request.get_json()
+        if not data or "state" not in data:
+            return jsonify({"error": "State is required"}), 400
+
+        state_list = data["state"]
+        state = np.array(state_list, dtype=np.float32)
+
+        # Get fatigue and engagement metrics
+        fatigue = data.get("fatigue", 0.0)
+        engagement = data.get("engagement", 0.0)
+        
+        # Adjust learning rate and gamma based on player state
+        base_lr = dqn_model.get_lr()
+        base_gamma = dqn_model.get_gamma()
+        
+        # Reduce learning during high fatigue, increase during high engagement
+        adjusted_lr = base_lr * (1 - fatigue * 0.5) * (0.5 + engagement * 0.5)
+        adjusted_gamma = base_gamma * (1 - fatigue * 0.2) * (0.8 + engagement * 0.2)
+        
+        dqn_model.update_lr(adjusted_lr)
+        dqn_model.update_gamma(adjusted_gamma)
+
+        # Ensure state dimension matches
+        if len(state) < dqn_model.state_dim:
+            state = np.pad(state, (0, dqn_model.state_dim - len(state)), mode='constant')
+        elif len(state) > dqn_model.state_dim:
+            state = state[:dqn_model.state_dim]
+
+        # Get action from DQN
+        training = data.get("training", True)
+        action_index, q_value = dqn_model.get_action(state, training=training)
+        
+        # Convert action to adjustments
+        adjustments = dqn_model.process_actions(action_index)
+
+        return jsonify({
+            "action_index": int(action_index),
+            "adjustments": adjustments,
+            "q_value": float(q_value),
+            "epsilon": float(dqn_model.epsilon)
+        })
+
+    except Exception as e:
+        print(f"Error in dqn_action: {str(e)}")
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
+
+
+@app.route("/dqn_train", methods=["POST"])
+def dqn_train():
+    """
+    Receive transitions and train DQN
+    Expected format: list of transitions with state, action, reward, next_state, done
+    """
+    try:
+        data = request.get_json()
+        if not data or "transitions" not in data:
+            return jsonify({"error": "Transitions are required"}), 400
+
+        transitions = data["transitions"]
+
+        # Store all transitions in replay buffer
+        for transition in transitions:
+            state = np.array(transition["state"], dtype=np.float32)
+            action = int(transition["action"])
+            reward = float(transition["reward"])
+            next_state = np.array(transition["next_state"], dtype=np.float32)
+            done = bool(transition.get("done", False))
+
+            dqn_model.store_transition(state, action, reward, next_state, done)
+
+        # Perform multiple updates
+        num_updates = data.get("num_updates", 5)
+        training_stats = []
+        
+        for _ in range(num_updates):
+            stats = dqn_model.update()
+            training_stats.append(stats)
+
+        # Update target network periodically
+        update_target = data.get("update_target", False)
+        if update_target:
+            dqn_model.update_target_network()
+            print("🎯 Target network updated")
+
+        # Save model
+        save_model_dqn()
+
+        # Average stats
+        avg_loss = np.mean([s["loss"] for s in training_stats])
+        avg_q = np.mean([s["q_value"] for s in training_stats])
+
+        return jsonify({
+            "message": "Training completed successfully",
+            "avg_loss": float(avg_loss),
+            "avg_q_value": float(avg_q),
+            "epsilon": float(dqn_model.epsilon),
+            "memory_size": len(dqn_model.memory)
+        })
+
+    except Exception as e:
+        print(f"Error in dqn_train: {str(e)}")
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
+
+
+@app.route("/store_rogl_session", methods=["POST"])
+def store_rogl_session():
+    """
+    Store ROGL game session data to CSV
+    """
+    try:
+        data = request.get_json()
+
+        # Create folder if missing
+        folder = "csv_logs"
+        os.makedirs(folder, exist_ok=True)
+
+        file_path = os.path.join(folder, "rogl_session_log.csv")
+        file_exists = os.path.isfile(file_path)
+
+        with open(file_path, "a", newline="") as f:
+            writer = csv.writer(f)
+
+            if not file_exists:
+                writer.writerow([
+                    "timestamp",
+                    "time",
+                    "state",
+                    "leftHand_x", "leftHand_y", "leftHand_z", "leftHand_active",
+                    "rightHand_x", "rightHand_y", "rightHand_z", "rightHand_active",
+                    "leftLeg_x", "leftLeg_y", "leftLeg_z", "leftLeg_active",
+                    "rightLeg_x", "rightLeg_y", "rightLeg_z", "rightLeg_active",
+                    "light0_state", "light1_state", "light2_state", "light3_state",
+                    "active_lanterns",
+                    "score",
+                    "fatigue",
+                    "engagement"
+                ])
+
+            writer.writerow([
+                datetime.now().isoformat(),
+                data.get("time", 0),
+                data.get("state", []),
+                
+                data["leftHand"]["x"], data["leftHand"]["y"], data["leftHand"]["z"], data["leftHand"]["active"],
+                data["rightHand"]["x"], data["rightHand"]["y"], data["rightHand"]["z"], data["rightHand"]["active"],
+                data["leftLeg"]["x"], data["leftLeg"]["y"], data["leftLeg"]["z"], data["leftLeg"]["active"],
+                data["rightLeg"]["x"], data["rightLeg"]["y"], data["rightLeg"]["z"], data["rightLeg"]["active"],
+                
+                data.get("light0_state", 0),
+                data.get("light1_state", 0),
+                data.get("light2_state", 0),
+                data.get("light3_state", 0),
+                data.get("active_lanterns", 0),
+                data.get("score", 0),
+                data.get("fatigue", 0),
+                data.get("engagement", 0)
             ])
 
         return jsonify({"status": "saved"}), 200
