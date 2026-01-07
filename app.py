@@ -484,6 +484,230 @@ def load_model_dqn():
 load_model_dqn()
 
 # -----------------------
+# MC PPO Implementation
+# -----------------------
+
+class MCPolicyNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.fc3 = nn.Linear(128, 64)
+        self.action_head = nn.Linear(64, action_dim)
+        self.relu = nn.ReLU()
+        self.tanh = nn.Tanh()
+
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        x = self.relu(self.fc3(x))
+        # Output continuous actions in range [-1, 1]
+        return self.tanh(self.action_head(x))
+
+    def get_dist(self, state):
+        mean = self.forward(state)
+        # Small fixed std for exploration
+        std = torch.ones_like(mean) * 0.1
+        return torch.distributions.Normal(mean, std)
+
+
+class MCValueNetwork(nn.Module):
+    def __init__(self, state_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.fc3 = nn.Linear(128, 64)
+        self.value_head = nn.Linear(64, 1)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        x = self.relu(self.fc3(x))
+        return self.value_head(x)
+
+
+class CustomMCPPO:
+    def __init__(self, state_dim, action_dim, lr=3e-4, gamma=0.99, clip_epsilon=0.2):
+        self.policy_net = MCPolicyNetwork(state_dim, action_dim)
+        self.value_net = MCValueNetwork(state_dim)
+        self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
+        self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=lr)
+        self.gamma = gamma
+        self.clip_epsilon = clip_epsilon
+        self.memory = deque(maxlen=10000)
+
+    def update_alpha(self, new_lr):
+        """Update learning rate"""
+        for param_group in self.policy_optimizer.param_groups:
+            param_group['lr'] = new_lr
+        for param_group in self.value_optimizer.param_groups:
+            param_group['lr'] = new_lr
+
+    def get_alpha(self):
+        """Get current learning rate"""
+        return self.policy_optimizer.param_groups[0]['lr']
+
+    def update_gamma(self, new_gamma):
+        """Update discount factor"""
+        self.gamma = new_gamma
+
+    def get_gamma(self):
+        """Get current discount factor"""
+        return self.gamma
+
+    def process_actions(self, action_array):
+        """
+        Convert network output to environment adjustments
+        action_array: [upper_threshold_delta, lower_threshold_delta, gap_delta, difficulty_delta]
+        All values in range [-1, 1]
+        """
+        delta_threshold = 5.0  # Max threshold change per step
+        delta_gap = 1.0        # Max gap change per step
+        
+        adjustments = {
+            "upper_threshold_change": float(action_array[0]) * delta_threshold,  # ±5%
+            "lower_threshold_change": float(action_array[1]) * delta_threshold,  # ±5%
+            "gap_change": float(action_array[2]) * delta_gap,                     # ±1 second
+            "difficulty_change": float(action_array[3])                            # -1 to 1 (for selection)
+        }
+        
+        return adjustments
+
+    def get_action(self, state):
+        """
+        Sample action from policy
+        Returns: action_array, log_prob
+        """
+        device = next(self.policy_net.parameters()).device
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+        
+        dist = self.policy_net.get_dist(state_tensor)
+        action = dist.sample()
+        log_prob = dist.log_prob(action).sum(dim=-1)
+        
+        return action.cpu().detach().numpy()[0], log_prob.item()
+
+    def store_transition(self, state, action, reward, next_state, done, log_prob):
+        """Store experience in replay buffer"""
+        self.memory.append((state, action, reward, next_state, done, log_prob))
+
+    def update(self, batch_size=64, epochs=10):
+        """Train PPO using collected experiences"""
+        if len(self.memory) < batch_size:
+            return {"loss": 0.0, "value_loss": 0.0, "policy_loss": 0.0}
+        
+        device = next(self.policy_net.parameters()).device
+        
+        # Get all experiences
+        states, actions, rewards, next_states, dones, old_log_probs = zip(*self.memory)
+        
+        states = torch.FloatTensor(np.array(states)).to(device)
+        actions = torch.FloatTensor(np.array(actions)).to(device)
+        rewards = torch.FloatTensor(np.array(rewards)).to(device)
+        next_states = torch.FloatTensor(np.array(next_states)).to(device)
+        dones = torch.FloatTensor(np.array(dones)).to(device)
+        old_log_probs = torch.FloatTensor(np.array(old_log_probs)).to(device)
+        
+        # Calculate advantages
+        with torch.no_grad():
+            values = self.value_net(states).squeeze()
+            next_values = self.value_net(next_states).squeeze()
+            targets = rewards + self.gamma * next_values * (1 - dones)
+            advantages = targets - values
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # PPO training loop
+        total_policy_loss = 0
+        total_value_loss = 0
+        
+        for epoch in range(epochs):
+            # Get current policy distribution
+            dist = self.policy_net.get_dist(states)
+            log_probs = dist.log_prob(actions).sum(dim=-1)
+            
+            # PPO clipped objective
+            ratios = torch.exp(log_probs - old_log_probs)
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages
+            policy_loss = -torch.mean(torch.min(surr1, surr2))
+            
+            # Value loss
+            value_loss = nn.MSELoss()(self.value_net(states).squeeze(), targets)
+            
+            # Update policy
+            self.policy_optimizer.zero_grad()
+            policy_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 0.5)
+            self.policy_optimizer.step()
+            
+            # Update value
+            self.value_optimizer.zero_grad()
+            value_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 0.5)
+            self.value_optimizer.step()
+            
+            total_policy_loss += policy_loss.item()
+            total_value_loss += value_loss.item()
+        
+        self.memory.clear()
+        
+        return {
+            "loss": (total_policy_loss + total_value_loss) / epochs,
+            "policy_loss": total_policy_loss / epochs,
+            "value_loss": total_value_loss / epochs
+        }
+
+
+# State: [similarity_history (last 5), current_score, difficulty_level]
+# Total: 5 + 1 + 1 = 7 dimensions
+state_dim = 7
+
+# Actions: [upper_threshold_change, lower_threshold_change, gap_change, difficulty_change]
+# Total: 4 continuous actions
+action_dim = 4
+
+mc_ppo_model = CustomMCPPO(state_dim, action_dim)
+
+MC_MODEL_PATH = "mc_ppo_model.pth"
+
+def save_mc_model():
+    """Save MC PPO model checkpoint"""
+    checkpoint = {
+        "policy_state_dict": mc_ppo_model.policy_net.state_dict(),
+        "value_state_dict": mc_ppo_model.value_net.state_dict(),
+        "policy_optimizer": mc_ppo_model.policy_optimizer.state_dict(),
+        "value_optimizer": mc_ppo_model.value_optimizer.state_dict(),
+        "gamma": mc_ppo_model.gamma,
+        "clip_epsilon": mc_ppo_model.clip_epsilon,
+    }
+    torch.save(checkpoint, MC_MODEL_PATH)
+    print(f"✅ MC PPO Model saved to {MC_MODEL_PATH}")
+
+def load_mc_model():
+    """Load MC PPO model checkpoint"""
+    if os.path.exists(MC_MODEL_PATH):
+        try:
+            checkpoint = torch.load(MC_MODEL_PATH, map_location="cpu")
+            mc_ppo_model.policy_net.load_state_dict(checkpoint["policy_state_dict"])
+            mc_ppo_model.value_net.load_state_dict(checkpoint["value_state_dict"])
+            mc_ppo_model.policy_optimizer.load_state_dict(checkpoint["policy_optimizer"])
+            mc_ppo_model.value_optimizer.load_state_dict(checkpoint["value_optimizer"])
+            mc_ppo_model.gamma = checkpoint["gamma"]
+            mc_ppo_model.clip_epsilon = checkpoint["clip_epsilon"]
+            print("✅ MC PPO Model loaded successfully")
+            return True
+        except Exception as e:
+            print(f"⚠️ Error loading model: {e}")
+            return False
+    else:
+        print("⚠️ No saved MC model found, starting fresh")
+        return False
+
+# Load model at startup
+load_mc_model()
+
+# -----------------------
 # Routes
 # -----------------------
 @app.route('/api/register', methods=['POST'])
@@ -1770,6 +1994,172 @@ def store_rogl_session():
         return jsonify({"status": "saved"}), 200
 
     except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+@app.route("/mc_action", methods=["POST"])
+def mc_action():
+    """
+    Receive state from Unity and return PPO action
+    Expected state format: [similarity_history (5 values), current_score, difficulty_level]
+    """
+    try:
+        data = request.get_json()
+        if not data or "state" not in data:
+            return jsonify({"error": "State is required"}), 400
+
+        state_list = data["state"]
+        state = np.array(state_list, dtype=np.float32)
+
+        # Get fatigue and engagement metrics
+        fatigue = data.get("fatigue", 0.0)
+        engagement = data.get("engagement", 0.0)
+        success_rate = data.get("success", 0.5)
+        
+        # Adjust learning parameters based on player state
+        base_lr = mc_ppo_model.get_alpha()
+        base_gamma = mc_ppo_model.get_gamma()
+        
+        # Reduce learning during high fatigue, increase during high engagement
+        adjusted_lr = base_lr * (1 - fatigue * 0.3) * (0.7 + engagement * 0.3)
+        adjusted_gamma = base_gamma * (1 - fatigue * 0.1) * (0.9 + success_rate * 0.1)
+        
+        mc_ppo_model.update_alpha(adjusted_lr)
+        mc_ppo_model.update_gamma(adjusted_gamma)
+
+        # Ensure state dimension matches
+        if len(state) < mc_ppo_model.policy_net.fc1.in_features:
+            state = np.pad(state, (0, mc_ppo_model.policy_net.fc1.in_features - len(state)), mode='constant')
+        elif len(state) > mc_ppo_model.policy_net.fc1.in_features:
+            state = state[:mc_ppo_model.policy_net.fc1.in_features]
+
+        # Get action from PPO
+        action_array, log_prob = mc_ppo_model.get_action(state)
+        
+        # Convert action to adjustments
+        adjustments = mc_ppo_model.process_actions(action_array)
+
+        return jsonify({
+            "action": action_array.tolist(),
+            "adjustments": adjustments,
+            "log_prob": float(log_prob)
+        })
+
+    except Exception as e:
+        print(f"Error in mc_action: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
+
+
+@app.route("/mc_train", methods=["POST"])
+def mc_train():
+    """
+    Receive transitions and train MC PPO
+    Expected format: list of transitions with state, action, reward, next_state, done, log_prob
+    """
+    try:
+        data = request.get_json()
+        if not data or "transitions" not in data:
+            return jsonify({"error": "Transitions are required"}), 400
+
+        transitions = data["transitions"]
+
+        # Store all transitions in memory
+        for transition in transitions:
+            state = np.array(transition["state"], dtype=np.float32)
+            action = np.array(transition["action"], dtype=np.float32)
+            reward = float(transition["reward"])
+            next_state = np.array(transition["next_state"], dtype=np.float32)
+            done = bool(transition.get("done", False))
+            log_prob = float(transition.get("log_prob", 0.0))
+
+            mc_ppo_model.store_transition(state, action, reward, next_state, done, log_prob)
+
+        # Train the model
+        batch_size = data.get("batch_size", 64)
+        epochs = data.get("epochs", 10)
+        
+        training_stats = mc_ppo_model.update(batch_size=batch_size, epochs=epochs)
+        
+        # Save model
+        save_mc_model()
+
+        return jsonify({
+            "message": "MC PPO training completed successfully",
+            "loss": float(training_stats["loss"]),
+            "policy_loss": float(training_stats["policy_loss"]),
+            "value_loss": float(training_stats["value_loss"]),
+            "memory_size": len(mc_ppo_model.memory)
+        })
+
+    except Exception as e:
+        print(f"Error in mc_train: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
+
+
+@app.route("/store_mc_session", methods=["POST"])
+def store_mc_session():
+    """
+    Store MC game session data to CSV
+    """
+    try:
+        data = request.get_json()
+
+        # Create folder if missing
+        folder = "csv_logs"
+        os.makedirs(folder, exist_ok=True)
+
+        file_path = os.path.join(folder, "mc_session_log.csv")
+        file_exists = os.path.isfile(file_path)
+
+        with open(file_path, "a", newline="") as f:
+            writer = csv.writer(f)
+
+            if not file_exists:
+                writer.writerow([
+                    "timestamp",
+                    "time",
+                    "similarity_current",
+                    "similarity_avg_5s",
+                    "score",
+                    "difficulty_level",
+                    "upper_threshold",
+                    "lower_threshold",
+                    "gap_between_actions",
+                    "current_animation",
+                    "fatigue",
+                    "engagement",
+                    "success_rate",
+                    "time_above_threshold",
+                    "time_below_threshold"
+                ])
+
+            writer.writerow([
+                datetime.now().isoformat(),
+                data.get("time", 0),
+                data.get("similarity_current", 0),
+                data.get("similarity_avg_5s", 0),
+                data.get("score", 0),
+                data.get("difficulty_level", 0),
+                data.get("upper_threshold", 80),
+                data.get("lower_threshold", 70),
+                data.get("gap_between_actions", 5),
+                data.get("current_animation", ""),
+                data.get("fatigue", 0),
+                data.get("engagement", 0),
+                data.get("success_rate", 0),
+                data.get("time_above_threshold", 0),
+                data.get("time_below_threshold", 0)
+            ])
+
+        return jsonify({"status": "saved"}), 200
+
+    except Exception as e:
+        print(f"Error in store_mc_session: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 @app.route('/usercodeunity', methods=['POST'])
