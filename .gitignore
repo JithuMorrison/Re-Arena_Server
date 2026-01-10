@@ -1,4 +1,6 @@
 venv
 .env
 ppo_model.pth
+dqn_rogl_model.pth
+mc_ppo_model.pth
 csv_logs
