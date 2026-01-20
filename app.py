@@ -805,7 +805,7 @@ def login():
         return jsonify({
             'message': 'Login successful',
             'user': {
-                'id': str(user['_id']),
+                'id': str(user['_id']),  # ✅ Changed from _id to id
                 'name': user['name'],
                 'email': user['email'],
                 'userType': user['userType'],
@@ -816,6 +816,7 @@ def login():
     except Exception as e:
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
+# Fix 2: Update get_therapist_patients to return complete patient data
 @app.route('/api/therapist/patients', methods=['GET'])
 def get_therapist_patients():
     try:
@@ -833,11 +834,25 @@ def get_therapist_patients():
         for patient_id in patient_ids:
             patient = users_collection.find_one({'_id': ObjectId(patient_id)})
             if patient:
-                patients.append(to_json(patient))
+                # ✅ Return complete patient data with proper field mapping
+                patient_data = {
+                    '_id': str(patient['_id']),
+                    'name': patient.get('name', ''),
+                    'email': patient.get('email', ''),
+                    'age': patient.get('age', ''),
+                    'condition': patient.get('condition', ''),
+                    'userCode': patient.get('userCode', ''),
+                    'userType': patient.get('userType', 'patient'),
+                    'therapistId': str(patient.get('therapistId', '')),
+                    'instructorId': str(patient.get('instructorId', '')) if patient.get('instructorId') else None,
+                    'createdAt': patient.get('createdAt', '')
+                }
+                patients.append(patient_data)
 
         return jsonify({'patients': patients}), 200
         
     except Exception as e:
+        print(f"Error in get_therapist_patients: {str(e)}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 @app.route('/api/therapist/add-patient', methods=['POST'])
@@ -1113,9 +1128,30 @@ def get_sessions():
             query['patientId'] = ObjectId(patient_id)
 
         sessions = list(sessions_collection.find(query).sort('date', -1))
-        return jsonify({'sessions': [to_json(s) for s in sessions]}), 200
+        
+        # ✅ Format sessions with proper ObjectId to string conversion
+        formatted_sessions = []
+        for session in sessions:
+            formatted_session = {
+                '_id': str(session['_id']),
+                'sessionId': session.get('sessionId', ''),
+                'therapistId': str(session.get('therapistId', '')),
+                'patientId': str(session.get('patientId', '')),
+                'instructorId': str(session.get('instructorId', '')) if session.get('instructorId') else None,
+                'gameData': session.get('gameData', {}),
+                'review': session.get('review', ''),
+                'rating': session.get('rating', 0),
+                'date': session.get('date'),
+                'status': session.get('status', 'completed'),
+                'duration': session.get('duration', ''),
+                'endTime': session.get('endTime')
+            }
+            formatted_sessions.append(formatted_session)
+        
+        return jsonify({'sessions': formatted_sessions}), 200
         
     except Exception as e:
+        print(f"Error in get_sessions: {str(e)}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 @app.route('/api/session/<session_id>', methods=['GET'])
@@ -1198,6 +1234,10 @@ def get_patient_games():
         if not patient_id or not therapist_id:
             return jsonify({'error': 'patientId and therapistId are required'}), 400
 
+        # ✅ Validate ObjectIds
+        if not ObjectId.is_valid(patient_id) or not ObjectId.is_valid(therapist_id):
+            return jsonify({'error': 'Invalid patient or therapist ID'}), 400
+
         therapist = therapists_collection.find_one({
             'userId': ObjectId(therapist_id),
             'patients': ObjectId(patient_id)
@@ -1212,15 +1252,20 @@ def get_patient_games():
         })
 
         if not patient_games:
+            # Return default configs for all available games
             default_configs = {
-                'bubble_game': GameConfig(
-                    game_name='bubble_game',
-                    difficulty='medium',
-                    target_score=20,
-                    max_bubbles=10,
-                    spawn_area={'x_min': -5, 'x_max': 5, 'y_min': 1, 'y_max': 5, 'z_min': -5, 'z_max': 5},
-                    enabled=True
-                ).__dict__
+                'bubble_game': {
+                    'game_name': 'bubble_game',
+                    'difficulty': 'medium',
+                    'enabled': True,
+                    'target_score': 20,
+                    'spawnAreaSize': 5.0,
+                    'bubbleSpeedAction': 5.0,
+                    'bubbleLifetime': 3.0,
+                    'spawnHeight': 3.0,
+                    'numBubbles': 10,
+                    'bubbleSize': 1.0
+                }
             }
             return jsonify({
                 'games': default_configs
@@ -1231,6 +1276,7 @@ def get_patient_games():
         }), 200
 
     except Exception as e:
+        print(f"Error in get_patient_games: {str(e)}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 @app.route('/api/therapist/update-patient-games', methods=['POST'])
@@ -1358,9 +1404,21 @@ def get_available_games():
 def get_instructors():
     try:
         instructors = list(instructors_collection.find({}))
-        return jsonify({'instructors': [to_json(instructor) for instructor in instructors]}), 200
+        formatted_instructors = []
+        
+        for instructor in instructors:
+            formatted_instructors.append({
+                '_id': str(instructor['_id']),
+                'userId': str(instructor['userId']),  # ✅ Include userId for assignment
+                'name': instructor.get('name', ''),
+                'email': instructor.get('email', ''),
+                'userCode': instructor.get('userCode', '')
+            })
+        
+        return jsonify({'instructors': formatted_instructors}), 200
         
     except Exception as e:
+        print(f"Error in get_instructors: {str(e)}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 @app.route('/api/therapist/create-report', methods=['POST'])
