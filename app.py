@@ -1905,6 +1905,8 @@ def dqn_action():
         # Adjust learning rate and gamma based on player state
         base_lr = dqn_model.get_lr()
         base_gamma = dqn_model.get_gamma()
+        #alpha = 0.3   # fatigue influence
+        #beta = 0.4
         
         # Reduce learning during high fatigue, increase during high engagement
         adjusted_lr = base_lr * (1 - fatigue * 0.5) * (0.5 + engagement * 0.5)
@@ -1912,6 +1914,16 @@ def dqn_action():
         
         dqn_model.update_lr(adjusted_lr)
         dqn_model.update_gamma(adjusted_gamma)
+        # prev_epsilon = dqn_model.epsilon
+        # epsilon_decay = dqn_model.epsilon_decay
+        # epsilon_min = dqn_model.epsilon_min
+
+        # adaptive_factor = 1 + alpha * fatigue - beta * engagement
+
+        # new_epsilon = prev_epsilon * epsilon_decay * adaptive_factor
+        # new_epsilon = max(epsilon_min, new_epsilon)
+
+        # dqn_model.epsilon = new_epsilon
 
         # Ensure state dimension matches
         if len(state) < dqn_model.state_dim:
